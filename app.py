@@ -36,6 +36,19 @@ APP_USER = os.environ.get("APP_USER")
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 PLAN_TTL = 3600  # Sekunden, wie lange ein Vorschlag gültig bleibt
 
+
+def _read_version():
+    for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), "/app/VERSION"):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            continue
+    return "dev"
+
+
+VERSION = _read_version()
+
 app = Flask(__name__)
 app.jinja_env.filters["de"] = lambda d: f"{d[8:10]}.{d[5:7]}.{d[0:4]}" if d and len(d) >= 10 else d
 PLANS = {}
@@ -380,14 +393,16 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.ver{margin-left:auto;padding:4px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.8rem;font-weight:600}
 ul{padding-left:18px}
 </style></head><body>
-<header><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></header>
+<header><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div><span class="ver">v{{ version }}</span></header>
 <main>
 {% block body %}{% endblock %}</main></body></html>"""
 
 
 def page(body, **ctx):
+    ctx.setdefault("version", VERSION)
     return render_template_string(BASE.replace("{% block body %}{% endblock %}", body), **ctx)
 
 
@@ -461,7 +476,7 @@ PREVIEW = """
   Korrespondenten: {% for c in sel_corrs %}<span class="pill tag">{{ c }}</span>{% else %}<span class="meta">alle</span>{% endfor %}<br>
   Zusätzliche Tags: {% for t in extra_tags %}<span class="pill" style="background:{{ t.color or '#6366f1' }};color:{{ t.text_color or '#fff' }}">{{ t.name }}</span>{% else %}<span class="meta">keine</span>{% endfor %}
   <p class="meta">Reihenfolge im neuen PDF: Rechnung zuerst, danach die Lieferscheine nach Datum.
-  Das neue Dokument übernimmt Titel, Korrespondent, Tags und Dokumententyp „{{ type_invoice }}“ der Rechnung.
+  Das neue Dokument übernimmt Titel, Korrespondent und Dokumententyp „{{ type_invoice }}“ der Rechnung sowie <b>alle Tags der Rechnung und der zugehörigen Lieferscheine</b>.
   <span class="badge sicher">sicher</span> Nummer gefunden ·
   <span class="badge mittel">mittel</span> Nummer gefunden, aber Auffälligkeit ·
   <span class="badge unsicher">unsicher</span> nur Korrespondent/Datum, standardmäßig abgewählt</p>
@@ -661,9 +676,18 @@ def execute():
     pl = Paperless()
     done, errors, tag_ls = [], [], []
     extra = stored.get("extra_tags", [])
+    try:
+        done_tag_id = pl.id_by_name("/api/tags/", DONE_TAG)
+    except Exception:  # noqa: BLE001
+        done_tag_id = None
     for inv, ls_ids in jobs:
-        # Das neue Dokument übernimmt die Tags der Rechnung -> zusätzliche Tags vorher an die Rechnung
-        add_now = [t for t in extra if t not in inv.get("tags", [])]
+        # Das neue Dokument übernimmt die Tags der Rechnung. Damit es auch die Tags der Lieferscheine
+        # und die gewählten Zusatz-Tags bekommt, werden diese vorher an die Rechnung gehängt.
+        wanted = []
+        for t in [*(t for lid in ls_ids for t in known_ls[lid].get("tags", [])), *extra]:
+            if t not in wanted and t not in inv.get("tags", []) and t != done_tag_id:
+                wanted.append(t)
+        add_now = wanted
         try:
             if add_now:
                 pl.modify_tags([inv["id"]], add=add_now)
@@ -682,7 +706,7 @@ def execute():
             try:  # Original-Rechnung bleibt erhalten -> dort die Zusatz-Tags wieder entfernen
                 pl.modify_tags([inv["id"]], remove=add_now)
             except Exception as e:  # noqa: BLE001
-                errors.append(f"{inv['title']}: Zusatz-Tags am Original nicht entfernt: {e}")
+                errors.append(f"{inv['title']}: übernommene Tags am Original nicht entfernt: {e}")
 
     if tag_ls and not stored["delete_originals"]:
         try:

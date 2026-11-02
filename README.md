@@ -1,10 +1,13 @@
 # paperless-merge
 
+**Aktuelle Version: 0.3** · [Änderungen](#versionen)
+
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
 
 - **Rechnung immer als erste Seite**, danach die Lieferscheine nach Datum
-- das neue Dokument läuft als Dokumententyp **Rechnung** und übernimmt Korrespondent, Tags und Speicherpfad der Rechnung
+- das neue Dokument läuft als Dokumententyp **Rechnung**, übernimmt Korrespondent und Speicherpfad der Rechnung
+  sowie **alle Tags der Rechnung und der zugehörigen Lieferscheine**
 - **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
@@ -26,6 +29,7 @@ die Paperless-API. Paperless selbst wird nicht verändert.
 - [Wie die Zuordnung funktioniert](#wie-die-zuordnung-funktioniert)
 - [Einstellungen](#einstellungen)
 - [Fehlerbehebung](#fehlerbehebung)
+- [Versionen](#versionen)
 
 ---
 
@@ -60,7 +64,11 @@ services:
 docker compose up -d
 ```
 
-Aufruf im Browser: **`http://<server-ip>:8085`**
+Aufruf im Browser: **`http://<server-ip>:8085`** – die laufende Version steht oben rechts in der Oberfläche.
+
+Statt `latest` kann auch eine feste Version verwendet werden, z. B.
+`ghcr.io/kaschperle8324/paperless-merge:0.3`. Dann wird erst aktualisiert, wenn die Versionsnummer
+in der Compose-Datei geändert wird.
 
 > **Hinweis:** Die Oberfläche hat standardmäßig keinen Login. Entweder nur im Heimnetz betreiben,
 > hinter einen Reverse-Proxy mit Anmeldung hängen oder `APP_USER` / `APP_PASSWORD` setzen.
@@ -70,7 +78,8 @@ Aufruf im Browser: **`http://<server-ip>:8085`**
 docker compose pull && docker compose up -d
 ```
 **Portainer:** *Stacks* → Stack öffnen → *Editor* → **Update the stack** → „Re-pull image and redeploy“ aktivieren → *Update*.
-Danach die Seite im Browser mit **Strg + F5** neu laden.
+Danach die Seite im Browser mit **Strg + F5** neu laden. Ob die neue Version läuft, zeigt die
+Versionsnummer oben rechts in der Oberfläche.
 
 ---
 
@@ -97,7 +106,8 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 
 **Tags für die neuen Dokumente**
 - Alle vorhandenen Paperless-Tags erscheinen in ihren Paperless-Farben.
-- Die ausgewählten Tags bekommt das zusammengeführte Dokument **zusätzlich** zu den Tags der Rechnung.
+- Die ausgewählten Tags bekommt das zusammengeführte Dokument **zusätzlich** zu den Tags, die Rechnung und
+  Lieferscheine ohnehin schon haben (siehe [Tags des neuen Dokuments](#tags-des-neuen-dokuments)).
 - Vorausgewählt sind die Tags aus `DEFAULT_TAGS` (Standard: *Posteingang*).
 - Ab mehr als 12 Tags erscheint ein Suchfeld.
 
@@ -145,7 +155,18 @@ Die Leiste mit **Abbrechen** und **Ausgewählte zusammenführen** bleibt beim Sc
 |---|---|---|
 | Rechnung + Lieferscheine | wandern in den **Paperless-Papierkorb** und sind dort wiederherstellbar | bleiben unverändert erhalten |
 | Lieferscheine beim nächsten Lauf | – | bekommen das Tag **`LS-zugeordnet`** und werden nicht mehr vorgeschlagen |
-| Zusatz-Tags (z. B. Posteingang) | nur am neuen Dokument | nur am neuen Dokument – an der Original-Rechnung werden sie wieder entfernt |
+| Tags von Lieferscheinen und Zusatz-Tags | am neuen Dokument | am neuen Dokument – die Original-Rechnung behält nur ihre eigenen Tags |
+
+### Tags des neuen Dokuments
+Das zusammengeführte Dokument bekommt **alle Tags zusammen**:
+1. die Tags der **Rechnung**,
+2. die Tags **aller zugehörigen Lieferscheine**,
+3. die auf der Startseite gewählten **Zusatz-Tags** (z. B. *Posteingang*).
+
+Doppelte Tags werden nur einmal gesetzt. Das interne Tag `LS-zugeordnet` wird nie übernommen.
+Technisch werden die Tags kurz vor dem Zusammenführen an die Rechnung gehängt, weil Paperless die
+Metadaten des neuen Dokuments von der Rechnung übernimmt. Bleiben die Originale erhalten, werden diese
+Tags danach an der Original-Rechnung wieder entfernt.
 
 Für den ersten Lauf empfiehlt es sich, die Originale zu **behalten** und einen kurzen Zeitraum zu wählen.
 
@@ -199,6 +220,23 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | Lieferscheine werden nicht gefunden | Prüfen, ob die Nummer im OCR-Text (Paperless → Dokument → *Inhalt*) hinter einem der oben genannten Begriffe steht. Bessere Erkennung: mit 300 dpi scannen, `PAPERLESS_OCR_LANGUAGE: deu` setzen, Dokument in Paperless *erneut verarbeiten*. |
 | Vorschlag „abgelaufen“ | Vorschläge gelten eine Stunde und nur für einen Lauf – einfach neu suchen. |
 | Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
+
+## Versionen
+Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
+(`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.3 (02.11.2026)
+Erste versionierte Ausgabe mit folgenden Funktionen:
+- Suche nach Rechnungen und Lieferscheinen in einem frei wählbaren Zeitraum, mit einstellbarem Vorlauf für Lieferscheine
+- Prüfseite mit Vorschaubildern, PDF-Ansicht und Bewertung *sicher* / *mittel* / *unsicher*
+- Zuordnungen an- und abwählen, Lieferscheine manuell hinzufügen, Schutz vor Doppelzuordnung, Sicherheitsabfrage
+- Zusammenführen mit der **Rechnung als erster Seite**, neues Dokument als Typ *Rechnung*
+- neues Dokument erhält **alle Tags von Rechnung und Lieferscheinen** plus frei wählbare Zusatz-Tags (Vorauswahl *Posteingang*)
+- Auswahl der **Korrespondenten** (durchsuchbar, mit Dokumentanzahl), Lieferscheine ohne Korrespondent optional
+- Originale wahlweise in den Papierkorb oder behalten (dann Tag `LS-zugeordnet`)
+- OCR-tolerante Nummernerkennung (`LI` ↔ `11`, `O` ↔ `0` …) und Schlüsselwörter *Beleg-Nr.* / *Belegnummer*
+- Knopf zum Entfernen des Titelzusatzes „(merged)“
+- modernes Design mit Dark Mode, volle Bildschirmbreite, Versionsanzeige
 
 ## Lizenz
 Siehe [LICENSE](LICENSE).
