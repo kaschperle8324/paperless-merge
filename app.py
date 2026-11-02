@@ -130,7 +130,7 @@ class Paperless:
 
 # --------------------------------------------------------------------------- Zuordnungslogik
 KEYWORDS = (r"(?:lieferscheine?|liefer\s*-?\s*schein|liefer-?nr|ls-?nr|lief\.?\s*-?\s*nr"
-            r"|delivery\s*note|lieferung)")
+            r"|delivery\s*note|lieferung|belegs?)")
 NUM_RE = re.compile(
     KEYWORDS + r"(?:\s*-?\s*(?:nr|nummer|no|number|#))?\.?\s*[:#.]?\s*(?=[A-Z\-/]{0,6}\d)([A-Z0-9][A-Z0-9\-/]{2,24})",
     re.I,
@@ -164,6 +164,15 @@ def delivery_numbers(doc):
             if n:
                 nums.add(n)
     return nums
+
+
+# typische OCR-Verwechslungen: L/I/| -> 1, O/Q -> 0, S -> 5, B -> 8, Z -> 2
+OCR_MAP = str.maketrans("LI|!OQSBZ", "111100582")
+
+
+def ocr_norm(text):
+    """Text so vereinheitlichen, dass z. B. '5LI12345' und '51112345' gleich aussehen."""
+    return (text or "").upper().translate(OCR_MAP)
 
 
 def contains_number(haystack_upper, num):
@@ -206,6 +215,8 @@ def build_plan(invoices, deliveries, corr, inv_start):
     inv_refs = {i["id"]: extract_numbers(i.get("content")) for i in invoices}
     ls_text = {d["id"]: f"{d.get('title', '')}\n{d.get('content', '')}".upper() for d in deliveries}
     ls_nums = {d["id"]: delivery_numbers(d) for d in deliveries}
+    inv_fz = {k: v.translate(OCR_MAP) for k, v in inv_text.items()}
+    ls_fz = {k: v.translate(OCR_MAP) for k, v in ls_text.items()}
 
     candidates = []
     for inv in invoices:
@@ -230,6 +241,20 @@ def build_plan(invoices, deliveries, corr, inv_start):
                         continue
                     if contains_number(ls_text[ls["id"]], n):
                         score, reason = 95, f"Rechnung nennt Lieferschein {n}, im Lieferschein gefunden"
+                        break
+            if not score:  # 2. Durchgang: OCR-tolerant (LI <-> 11, O <-> 0 ...)
+                for n in sorted(ls_nums[ls["id"]]):
+                    if sum(c.isdigit() for c in n) < 5 and not same_corr:
+                        continue
+                    if contains_number(inv_fz[inv["id"]], ocr_norm(n)):
+                        score, reason = 90, f"Lieferschein-Nr. {n} steht in der Rechnung (OCR-tolerant verglichen)"
+                        break
+            if not score:
+                for n in sorted(inv_refs[inv["id"]]):
+                    if sum(c.isdigit() for c in n) < 5 and not same_corr:
+                        continue
+                    if contains_number(ls_fz[ls["id"]], ocr_norm(n)):
+                        score, reason = 90, f"Rechnung nennt Lieferschein {n}, im Lieferschein gefunden (OCR-tolerant)"
                         break
             if score and diff_corr:
                 score -= 40

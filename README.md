@@ -49,6 +49,12 @@ Der Token-Benutzer braucht in Paperless Rechte zum Anzeigen, Ändern, Hinzufüge
   und werden nicht erneut angeboten.
 - Paperless hängt „(merged)“ an den Titel an – auf der Ergebnisseite gibt es einen Knopf zum Entfernen.
 
+## Erkennung der Lieferscheinnummer
+Nummern werden hinter Begriffen wie „Lieferschein“, „Lieferschein-Nr.“, „LS-Nr.“, „Lieferung“,
+„Beleg-Nr.“/„Belegnummer“ und „Delivery Note“ gelesen und im jeweils anderen Dokument gesucht.
+Der Vergleich ist OCR-tolerant: typische Verwechslungen wie **LI ↔ 11**, O ↔ 0, S ↔ 5, B ↔ 8 werden
+als gleich gewertet (z. B. `4LI123456` = `411123456`).
+
 ## Einstellungen (Umgebungsvariablen)
 | Variable | Standard | Bedeutung |
 |---|---|---|
