@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.4** · [Änderungen](#versionen)
+**Aktuelle Version: 0.5** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -125,6 +125,7 @@ die Originale gelöscht werden.
 Darunter steht jede Rechnung als eigene Karte (auf breiten Bildschirmen mehrere nebeneinander):
 - **Vorschaubild** und Link **PDF ansehen** (bzw. *in Paperless öffnen*, wenn `PAPERLESS_PUBLIC_URL` gesetzt ist)
 - Datum, Korrespondent und ggf. ASN
+- **Lieferschein-Nr. in der Rechnung:** alle Lieferscheinnummern, die im Text der Rechnung gefunden wurden
 - darunter die vorgeschlagenen Lieferscheine mit Bewertung und Begründung:
 
 | Markierung | Bedeutung | Vorauswahl |
@@ -132,6 +133,16 @@ Darunter steht jede Rechnung als eigene Karte (auf breiten Bildschirmen mehrere 
 | 🟢 **sicher** | Lieferscheinnummer in der Rechnung gefunden (oder die Rechnung nennt eine Nummer, die im Lieferschein steht) – auch OCR-tolerant | angehakt |
 | 🟠 **mittel** | Nummer gefunden, aber Rechnung und Lieferschein haben **unterschiedliche Korrespondenten** | angehakt – bitte prüfen |
 | 🔴 **unsicher** | keine Nummer gefunden, nur gleicher Korrespondent und passendes Datum | **nicht** angehakt |
+
+Bei jedem vorgeschlagenen Lieferschein steht außerdem **Erkannte Nr.:** – die Nummern, die im Lieferschein
+erkannt wurden. Die Nummer, über die Rechnung und Lieferschein zugeordnet wurden, ist **grün mit ✓**
+markiert, bei der Rechnung und beim Lieferschein. So ist auf einen Blick zu sehen:
+- welche Nummer die Zuordnung ausgelöst hat (auch wenn sie OCR-bedingt unterschiedlich geschrieben ist, z. B. `4LI123456` ↔ `411123456`),
+- welche Nummern in der Rechnung stehen, zu denen **kein** Lieferschein gefunden wurde (graue Nummer ohne ✓),
+- bei welchen Lieferscheinen gar keine Nummer erkannt wurde (*keine erkannt*).
+
+Auch in der Liste der nicht zugeordneten Lieferscheine und im Auswahlfeld zum manuellen Hinzufügen
+stehen die erkannten Nummern.
 
 **Anpassen**
 - Haken an der **Rechnung** entfernen → diese Rechnung wird nicht bearbeitet.
@@ -235,6 +246,12 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.5 (03.11.2026)
+- Prüfseite zeigt bei jeder Rechnung die darin gefundenen Lieferscheinnummern
+- bei jedem Lieferschein werden die erkannten Nummern angezeigt
+- die Nummer, über die zugeordnet wurde, ist grün mit ✓ markiert; Nummern ohne passenden Lieferschein bleiben grau
+- erkannte Nummern auch bei nicht zugeordneten Lieferscheinen und im Auswahlfeld zum manuellen Hinzufügen
 
 ### Version 0.4 (02.11.2026)
 - „(merged)“ kann sich bei mehreren Durchläufen nicht mehr stapeln: ein vorhandener Zusatz wird vor dem Zusammenführen aus dem Rechnungstitel entfernt

@@ -268,6 +268,17 @@ def build_plan(invoices, deliveries, corr, inv_start):
     ls_nums = {d["id"]: delivery_numbers(d) for d in deliveries}
     inv_fz = {k: v.translate(OCR_MAP) for k, v in inv_text.items()}
     ls_fz = {k: v.translate(OCR_MAP) for k, v in ls_text.items()}
+    all_ls_nums = sorted({n for ns in ls_nums.values() for n in ns})
+    inv_found = {}
+    for i in invoices:
+        found, seen = [], set()
+        for n in sorted(inv_refs[i["id"]]) + [n for n in all_ls_nums
+                                              if contains_number(inv_text[i["id"]], n)
+                                              or contains_number(inv_fz[i["id"]], ocr_norm(n))]:
+            if ocr_norm(n) not in seen:
+                seen.add(ocr_norm(n))
+                found.append(n)
+        inv_found[i["id"]] = found
 
     candidates = []
     for inv in invoices:
@@ -276,14 +287,14 @@ def build_plan(invoices, deliveries, corr, inv_start):
             ldate, lcorr = _date(ls), ls.get("correspondent")
             same_corr = icorr is not None and icorr == lcorr
             diff_corr = icorr is not None and lcorr is not None and icorr != lcorr
-            score, reason = 0, ""
+            score, reason, matched = 0, "", None
 
             for n in sorted(ls_nums[ls["id"]]):
                 short = sum(c.isdigit() for c in n) < 5
                 if short and not same_corr:
                     continue
                 if contains_number(inv_text[inv["id"]], n):
-                    score, reason = 100, f"Lieferschein-Nr. {n} steht in der Rechnung"
+                    score, reason, matched = 100, f"Lieferschein-Nr. {n} steht in der Rechnung", n
                     break
             if not score:
                 for n in sorted(inv_refs[inv["id"]]):
@@ -291,21 +302,21 @@ def build_plan(invoices, deliveries, corr, inv_start):
                     if short and not same_corr:
                         continue
                     if contains_number(ls_text[ls["id"]], n):
-                        score, reason = 95, f"Rechnung nennt Lieferschein {n}, im Lieferschein gefunden"
+                        score, reason, matched = 95, f"Rechnung nennt Lieferschein {n}, im Lieferschein gefunden", n
                         break
             if not score:  # 2. Durchgang: OCR-tolerant (LI <-> 11, O <-> 0 ...)
                 for n in sorted(ls_nums[ls["id"]]):
                     if sum(c.isdigit() for c in n) < 5 and not same_corr:
                         continue
                     if contains_number(inv_fz[inv["id"]], ocr_norm(n)):
-                        score, reason = 90, f"Lieferschein-Nr. {n} steht in der Rechnung (OCR-tolerant verglichen)"
+                        score, reason, matched = 90, f"Lieferschein-Nr. {n} steht in der Rechnung (OCR-tolerant verglichen)", n
                         break
             if not score:
                 for n in sorted(inv_refs[inv["id"]]):
                     if sum(c.isdigit() for c in n) < 5 and not same_corr:
                         continue
                     if contains_number(ls_fz[ls["id"]], ocr_norm(n)):
-                        score, reason = 90, f"Rechnung nennt Lieferschein {n}, im Lieferschein gefunden (OCR-tolerant)"
+                        score, reason, matched = 90, f"Rechnung nennt Lieferschein {n}, im Lieferschein gefunden (OCR-tolerant)", n
                         break
             if score and diff_corr:
                 score -= 40
@@ -314,15 +325,15 @@ def build_plan(invoices, deliveries, corr, inv_start):
                     idate - dt.timedelta(days=FALLBACK_DAYS) <= ldate <= idate + dt.timedelta(days=3):
                 score, reason = 30, "nur gleicher Korrespondent + passendes Datum (keine Nummer gefunden)"
             if score:
-                candidates.append((score, abs((idate - ldate).days), inv["id"], ls["id"], reason))
+                candidates.append((score, abs((idate - ldate).days), inv["id"], ls["id"], reason, matched))
 
     candidates.sort(key=lambda c: (-c[0], c[1]))
     used_ls, matches = set(), {}
-    for score, _, inv_id, ls_id, reason in candidates:
+    for score, _, inv_id, ls_id, reason, matched in candidates:
         if ls_id in used_ls:
             continue
         used_ls.add(ls_id)
-        matches.setdefault(inv_id, []).append((ls_id, score, reason))
+        matches.setdefault(inv_id, []).append((ls_id, score, reason, matched))
 
     ls_by_id = {d["id"]: d for d in deliveries}
     groups, without = [], []
@@ -330,16 +341,23 @@ def build_plan(invoices, deliveries, corr, inv_start):
         if _date(inv) < inv_start:
             continue
         items = []
-        for ls_id, score, reason in matches.get(inv["id"], []):
+        for ls_id, score, reason, matched in matches.get(inv["id"], []):
             lvl = level_of(score)
             items.append({**summarize(ls_by_id[ls_id], corr), "score": score, "reason": reason,
-                          "level": lvl, "checked": lvl != "unsicher"})
+                          "level": lvl, "checked": lvl != "unsicher",
+                          "nums": [{"n": x, "hit": matched is not None and ocr_norm(x) == ocr_norm(matched)}
+                                   for x in sorted(ls_nums[ls_id])]})
         items.sort(key=lambda x: x["date"])
-        entry = {"inv": summarize(inv, corr), "items": items,
+        hits = {ocr_norm(i["nums"][k]["n"]) for i in items for k in range(len(i["nums"])) if i["nums"][k]["hit"]}
+        hits |= {ocr_norm(m[3]) for m in matches.get(inv["id"], []) if m[3]}
+        inv_sum = summarize(inv, corr)
+        inv_sum["nums"] = [{"n": x, "hit": ocr_norm(x) in hits} for x in inv_found[inv["id"]]]
+        entry = {"inv": inv_sum, "items": items,
                  "checked": any(i["checked"] for i in items)}
         (groups if items else without).append(entry)
 
-    unassigned = [summarize(d, corr) for d in deliveries if d["id"] not in used_ls]
+    unassigned = [{**summarize(d, corr), "nums": [{"n": x, "hit": False} for x in sorted(ls_nums[d["id"]])]}
+                  for d in deliveries if d["id"] not in used_ls]
     return {"groups": groups, "without": without, "unassigned": unassigned}
 
 
@@ -431,6 +449,14 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.nums{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px;font-size:.82rem}
+.nums .nl{color:var(--muted);margin-right:2px}
+.num{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.8rem;padding:1px 8px;border-radius:6px;
+  background:var(--surface2);border:1px solid var(--line);color:var(--text)}
+.num.hit{background:var(--ok-bg);border-color:var(--ok);color:var(--ok);font-weight:600}
+.num.hit::before{content:"✓ "}
+.none{color:var(--muted);font-style:italic;font-size:.8rem}
+li .num{margin-left:6px}
 .ver{margin-left:auto;padding:4px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.8rem;font-weight:600}
 ul{padding-left:18px}
 </style></head><body>
@@ -523,7 +549,8 @@ PREVIEW = """
   Das neue Dokument übernimmt Titel, Korrespondent und Dokumententyp „{{ type_invoice }}“ der Rechnung sowie <b>alle Tags der Rechnung und der zugehörigen Lieferscheine</b>.
   <span class="badge sicher">sicher</span> Nummer gefunden ·
   <span class="badge mittel">mittel</span> Nummer gefunden, aber Auffälligkeit ·
-  <span class="badge unsicher">unsicher</span> nur Korrespondent/Datum, standardmäßig abgewählt</p>
+  <span class="badge unsicher">unsicher</span> nur Korrespondent/Datum, standardmäßig abgewählt ·
+  <span class="num hit">Nummer</span> = darüber wurde zugeordnet</p>
 </div>
 
 {% macro group(g) %}
@@ -533,7 +560,9 @@ PREVIEW = """
     <a href="{{ link(g.inv.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=g.inv.id) }}"></a>
     <div><span class="tag">{{ type_invoice }}</span> <b>{{ g.inv.title }}</b><br>
       <span class="meta">{{ g.inv.date|de }} · {{ g.inv.correspondent }}{% if g.inv.asn %} · ASN {{ g.inv.asn }}{% endif %} ·
-      <a href="{{ link(g.inv.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span></div>
+      <a href="{{ link(g.inv.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span>
+      <div class="nums"><span class="nl">Lieferschein-Nr. in der Rechnung:</span>
+        {% for x in g.inv.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}</span>{% else %}<span class="none">keine gefunden</span>{% endfor %}</div></div>
   </div>
   {% if g['items'] %}<div class="items">{% endif %}
   {% for i in g['items'] %}
@@ -541,14 +570,16 @@ PREVIEW = """
     <input type="checkbox" name="ls_{{ g.inv.id }}" value="{{ i.id }}" class="ls" data-inv="{{ g.inv.id }}" {{ 'checked' if i.checked }}>
     <a href="{{ link(i.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=i.id) }}"></a>
     <div><span class="badge {{ i.level }}">{{ i.level }}</span> <b>{{ i.title }}</b><br>
-      <span class="meta">{{ i.date|de }} · {{ i.correspondent }} · {{ i.reason }}</span></div>
+      <span class="meta">{{ i.date|de }} · {{ i.correspondent }} · {{ i.reason }}</span>
+      <div class="nums"><span class="nl">Erkannte Nr.:</span>
+        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}</div></div>
   </div>
   {% endfor %}
   {% if g['items'] %}</div>{% endif %}
   {% if plan.unassigned %}
   <p class="meta" style="margin:12px 0 0 32px">Weitere Lieferscheine manuell hinzufügen (Strg/Cmd für Mehrfachauswahl):</p>
   <select name="add_{{ g.inv.id }}" multiple size="3" class="add" data-inv="{{ g.inv.id }}">
-    {% for u in plan.unassigned %}<option value="{{ u.id }}">{{ u.date|de }} · {{ u.correspondent }} · {{ u.title }}</option>{% endfor %}
+    {% for u in plan.unassigned %}<option value="{{ u.id }}">{{ u.date|de }} · {{ u.correspondent }} · {{ u.title }}{% if u.nums %} · Nr. {{ u.nums|map(attribute='n')|join(', ') }}{% endif %}</option>{% endfor %}
   </select>
   {% endif %}
 </div>
@@ -562,7 +593,8 @@ PREVIEW = """
 {% if plan.unassigned %}
 <details class="card"><summary><b>{{ plan.unassigned|length }} nicht zugeordnete Lieferscheine</b></summary>
 <ul>{% for u in plan.unassigned %}<li><a href="{{ link(u.id) }}" target="_blank">{{ u.title }}</a>
-  <span class="meta">{{ u.date|de }} · {{ u.correspondent }}</span></li>{% endfor %}</ul></details>
+  <span class="meta">{{ u.date|de }} · {{ u.correspondent }}</span>
+  {% for x in u.nums %}<span class="num">{{ x.n }}</span>{% else %}<span class="none">keine Nr. erkannt</span>{% endfor %}</li>{% endfor %}</ul></details>
 {% endif %}
 
 <div class="card bar"><a class="btn sec" href="{{ url_for('index') }}">← Abbrechen</a>
