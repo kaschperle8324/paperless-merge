@@ -80,7 +80,7 @@ class Paperless:
             return tid
         return self.send("POST", "/api/tags/", {"name": name, "matching_algorithm": 0})["id"]
 
-    def documents(self, type_id, start, end, exclude_tag=None):
+    def documents(self, type_id, start, end, exclude_tag=None, corr_ids=None, corr_none=False):
         params = {
             "document_type__id": type_id,
             "created__gte": start.isoformat(),
@@ -90,7 +90,18 @@ class Paperless:
         }
         if exclude_tag:
             params["tags__id__none"] = exclude_tag
+        if corr_none:
+            params["correspondent__isnull"] = "true"
+            docs = self.all("/api/documents/", **params)
+            return [d for d in docs if d.get("correspondent") is None]
+        if corr_ids:
+            params["correspondent__id__in"] = ",".join(map(str, sorted(corr_ids)))
+            docs = self.all("/api/documents/", **params)
+            return [d for d in docs if d.get("correspondent") in corr_ids]
         return self.all("/api/documents/", **params)
+
+    def correspondent_list(self):
+        return sorted(self.all("/api/correspondents/"), key=lambda c: c["name"].lower())
 
     def correspondents(self):
         return {c["id"]: c["name"] for c in self.all("/api/correspondents/")}
@@ -293,10 +304,17 @@ header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--surfac
   display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
 header h1{font-size:1.05rem;margin:0;font-weight:650}
 header small{color:var(--muted);display:block;font-size:.8rem;font-weight:400}
-main{max-width:1080px;margin:24px auto 40px;padding:0 16px}
+main{margin:24px 0 40px;padding:0 clamp(12px,2vw,32px)}
 h3{margin:0 0 12px;font-size:1.05rem;font-weight:650}
 .card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr));gap:28px}
+.cols>section{min-width:0}
+.groups{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(620px,100%),1fr));gap:16px;align-items:start}
+.groups>.card{margin-bottom:0}
+.chip.plain span{--c:var(--accent);--tc:#fff}
+.chip .cnt{font-style:normal;opacity:.6;font-size:.78rem;margin-left:6px}
+.linkbtn{background:none;border:0;box-shadow:none;color:var(--accent);padding:0;font-size:.85rem;font-weight:600;cursor:pointer}
 label.f{display:block;margin:0 0 6px;font-size:.85rem;font-weight:600;color:var(--muted)}
 input[type=date],input[type=number],input[type=search],select{width:100%;padding:10px 12px;font:inherit;color:var(--text);
   background:var(--surface2);border:1px solid var(--line);border-radius:10px;outline:none}
@@ -333,6 +351,7 @@ img.th:hover{transform:scale(1.05)}
 .stat{background:var(--surface2);border:1px solid var(--line);border-radius:12px;padding:8px 14px}
 .stat b{font-size:1.2rem;display:block}
 details.card summary{cursor:pointer;font-weight:600}
+details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
@@ -350,35 +369,56 @@ def page(body, **ctx):
 INDEX = """
 {% if error %}<div class="card err">{{ error }}</div>{% endif %}
 <form class="card" method="post" action="{{ url_for('preview') }}">
-  <h3>1 · Zeitraum &amp; Optionen</h3>
-  <div class="grid2">
-    <div><label class="f">Rechnungsdatum von</label><input type="date" name="start" value="{{ start }}" required></div>
-    <div><label class="f">Rechnungsdatum bis</label><input type="date" name="end" value="{{ end }}" required></div>
-    <div><label class="f">Lieferscheine zusätzlich Tage vorher</label>
-      <input type="number" name="lookback" value="{{ lookback }}" min="0" max="365"></div>
-  </div>
-  <label class="switch"><input type="checkbox" name="delete_originals" value="1" checked>
-    Originale nach dem Zusammenführen in den Papierkorb verschieben</label>
-  <p class="meta">Ohne Haken bleiben die Originale erhalten; verwendete Lieferscheine bekommen das Tag
-    „{{ done_tag }}“ und werden beim nächsten Lauf nicht mehr vorgeschlagen.</p>
+ <div class="cols">
+  <section>
+   <h3>1 · Zeitraum &amp; Optionen</h3>
+   <div class="grid2">
+     <div><label class="f">Rechnungsdatum von</label><input type="date" name="start" value="{{ start }}" required></div>
+     <div><label class="f">Rechnungsdatum bis</label><input type="date" name="end" value="{{ end }}" required></div>
+     <div><label class="f">Lieferscheine zusätzlich Tage vorher</label>
+       <input type="number" name="lookback" value="{{ lookback }}" min="0" max="365"></div>
+   </div>
+   <label class="switch"><input type="checkbox" name="delete_originals" value="1" checked>
+     Originale nach dem Zusammenführen in den Papierkorb verschieben</label>
+   <p class="meta">Ohne Haken bleiben die Originale erhalten; verwendete Lieferscheine bekommen das Tag
+     „{{ done_tag }}“ und werden beim nächsten Lauf nicht mehr vorgeschlagen.</p>
+  </section>
 
-  <h3 style="margin-top:22px">Tags für die neuen Dokumente</h3>
-  <p class="meta" style="margin:0">Zusätzlich zu den Tags der Rechnung. Anklicken zum An-/Abwählen.</p>
-  {% if tags %}
-  {% if tags|length > 12 %}<input type="search" id="tagfilter" placeholder="Tag suchen …" style="margin-top:10px">{% endif %}
-  <div class="chips" id="chips">
-    {% for t in tags %}<label class="chip" data-name="{{ t.name|lower }}"><input type="checkbox" name="tags" value="{{ t.id }}"
-      {{ 'checked' if t.preselect }}><span style="--c:{{ t.color or '#6366f1' }};--tc:{{ t.text_color or '#ffffff' }}">{{ t.name }}</span></label>{% endfor %}
-  </div>
-  {% else %}<p class="meta">Keine Tags geladen.</p>{% endif %}
+  <section>
+   <h3>Korrespondenten</h3>
+   <p class="meta" style="margin:0">Nichts ausgewählt = alle durchsuchen.
+     <button type="button" class="linkbtn" data-clear="corrchips">Auswahl leeren</button></p>
+   {% if corrs %}
+   {% if corrs|length > 12 %}<input type="search" class="filter" data-target="corrchips" placeholder="Korrespondent suchen …" style="margin-top:10px">{% endif %}
+   <div class="chips" id="corrchips">
+     {% for c in corrs %}<label class="chip plain" data-name="{{ c.name|lower }}"><input type="checkbox" name="corr" value="{{ c.id }}"><span>{{ c.name }}{% if c.document_count is not none %}<em class="cnt">{{ c.document_count }}</em>{% endif %}</span></label>{% endfor %}
+   </div>
+   <label class="switch"><input type="checkbox" name="corr_none" value="1" checked>
+     Lieferscheine ohne Korrespondent mit durchsuchen</label>
+   {% else %}<p class="meta">Keine Korrespondenten geladen.</p>{% endif %}
+  </section>
 
-  <div style="margin-top:22px"><button>Suchen &amp; Vorschläge anzeigen →</button></div>
+  <section>
+   <h3>Tags für die neuen Dokumente</h3>
+   <p class="meta" style="margin:0">Zusätzlich zu den Tags der Rechnung. Anklicken zum An-/Abwählen.</p>
+   {% if tags %}
+   {% if tags|length > 12 %}<input type="search" class="filter" data-target="tagchips" placeholder="Tag suchen …" style="margin-top:10px">{% endif %}
+   <div class="chips" id="tagchips">
+     {% for t in tags %}<label class="chip" data-name="{{ t.name|lower }}"><input type="checkbox" name="tags" value="{{ t.id }}"
+       {{ 'checked' if t.preselect }}><span style="--c:{{ t.color or '#6366f1' }};--tc:{{ t.text_color or '#ffffff' }}">{{ t.name }}</span></label>{% endfor %}
+   </div>
+   {% else %}<p class="meta">Keine Tags geladen.</p>{% endif %}
+  </section>
+ </div>
+ <div style="margin-top:24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+   <button>Suchen &amp; Vorschläge anzeigen →</button>
+   <span class="meta">Es wird noch nichts verändert – im nächsten Schritt prüfst du alle Zuordnungen.</span></div>
 </form>
-<div class="card meta">Es wird noch nichts verändert – im nächsten Schritt prüfst du alle Zuordnungen.</div>
 <script>
-const f=document.getElementById('tagfilter');
-if(f)f.addEventListener('input',()=>{const q=f.value.toLowerCase();
-  document.querySelectorAll('#chips .chip').forEach(c=>c.style.display=c.dataset.name.includes(q)||c.querySelector('input').checked?'':'none')});
+document.querySelectorAll('input.filter').forEach(f=>f.addEventListener('input',()=>{const q=f.value.toLowerCase();
+  document.querySelectorAll('#'+f.dataset.target+' .chip').forEach(c=>c.style.display=c.dataset.name.includes(q)||c.querySelector('input').checked?'':'none')}));
+document.querySelectorAll('[data-clear]').forEach(b=>b.addEventListener('click',()=>
+  document.querySelectorAll('#'+b.dataset.clear+' input').forEach(i=>i.checked=false)));
 </script>
 """
 
@@ -393,6 +433,7 @@ PREVIEW = """
     <div class="stat"><b>{{ plan.unassigned|length }}</b><span class="meta">Lieferscheine frei</span></div>
   </div>
   Originale: <b>{{ "werden in den Papierkorb verschoben" if delete_originals else "bleiben erhalten" }}</b><br>
+  Korrespondenten: {% for c in sel_corrs %}<span class="pill tag">{{ c }}</span>{% else %}<span class="meta">alle</span>{% endfor %}<br>
   Zusätzliche Tags: {% for t in extra_tags %}<span class="pill" style="background:{{ t.color or '#6366f1' }};color:{{ t.text_color or '#fff' }}">{{ t.name }}</span>{% else %}<span class="meta">keine</span>{% endfor %}
   <p class="meta">Reihenfolge im neuen PDF: Rechnung zuerst, danach die Lieferscheine nach Datum.
   Das neue Dokument übernimmt Titel, Korrespondent, Tags und Dokumententyp „{{ type_invoice }}“ der Rechnung.
@@ -429,10 +470,10 @@ PREVIEW = """
 </div>
 {% endmacro %}
 
-{% for g in plan.groups %}{{ group(g) }}{% endfor %}
+<div class="groups">{% for g in plan.groups %}{{ group(g) }}{% endfor %}</div>
 {% if plan.without %}
 <details class="card"><summary><b>{{ plan.without|length }} Rechnungen ohne gefundenen Lieferschein</b> (manuell zuordenbar)</summary>
-{% for g in plan.without %}{{ group(g) }}{% endfor %}</details>
+<div class="groups">{% for g in plan.without %}{{ group(g) }}{% endfor %}</div></details>
 {% endif %}
 {% if plan.unassigned %}
 <details class="card"><summary><b>{{ plan.unassigned|length }} nicht zugeordnete Lieferscheine</b></summary>
@@ -495,17 +536,19 @@ def _cleanup_plans():
 def index(error=None):
     today = dt.date.today()
     first_prev = (today.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
-    tags = []
+    tags, corrs = [], []
     try:
-        for t in Paperless().tags():
+        pl = Paperless()
+        corrs = pl.correspondent_list()
+        for t in pl.tags():
             if t["name"] == DONE_TAG:
                 continue
             t["preselect"] = t["name"].lower() in DEFAULT_TAGS
             tags.append(t)
     except Exception as e:  # noqa: BLE001
-        error = error or f"Tags konnten nicht geladen werden: {e}"
+        error = error or f"Tags/Korrespondenten konnten nicht geladen werden: {e}"
     return page(INDEX, error=error, start=first_prev.isoformat(), end=today.isoformat(),
-                lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, tags=tags)
+                lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, tags=tags, corrs=corrs)
 
 
 @app.route("/preview", methods=["POST"])
@@ -521,6 +564,8 @@ def preview():
     if end < start:
         return index(error="Das Enddatum liegt vor dem Startdatum.")
     delete_originals = request.form.get("delete_originals") == "1"
+    corr_ids = {int(x) for x in request.form.getlist("corr") if x.isdigit()}
+    corr_none = request.form.get("corr_none") == "1"
 
     try:
         pl = Paperless()
@@ -530,8 +575,13 @@ def preview():
             return index(error=f"Dokumententyp „{TYPE_INVOICE}“ oder „{TYPE_DELIVERY}“ nicht gefunden.")
         done_tag = pl.id_by_name("/api/tags/", DONE_TAG)
         # Rechnungen mit etwas Puffer laden, damit Lieferscheine an die "beste" Rechnung gehen
-        invoices = pl.documents(t_inv, start - dt.timedelta(days=lookback), end + dt.timedelta(days=FALLBACK_DAYS))
-        deliveries = pl.documents(t_ls, start - dt.timedelta(days=lookback), end, exclude_tag=done_tag)
+        ls_from = start - dt.timedelta(days=lookback)
+        invoices = pl.documents(t_inv, ls_from, end + dt.timedelta(days=FALLBACK_DAYS), corr_ids=corr_ids)
+        deliveries = pl.documents(t_ls, ls_from, end, exclude_tag=done_tag, corr_ids=corr_ids)
+        if corr_ids and corr_none:  # nur bei Filter nötig – ohne Filter sind diese schon enthalten
+            deliveries += pl.documents(t_ls, ls_from, end, exclude_tag=done_tag, corr_none=True)
+        elif not corr_ids and not corr_none:
+            deliveries = [d for d in deliveries if d.get("correspondent") is not None]
         corr = pl.correspondents()
         wanted = {int(x) for x in request.form.getlist("tags") if x.isdigit()}
         extra_tags = [t for t in pl.tags() if t["id"] in wanted] if wanted else []
@@ -548,7 +598,8 @@ def preview():
                           "extra_tags": [t["id"] for t in extra_tags]}
     return page(PREVIEW, plan=plan, plan_id=plan_id, start=start, end=end,
                 delete_originals=delete_originals, public=PAPERLESS_PUBLIC_URL, link=doc_link,
-                type_invoice=TYPE_INVOICE, extra_tags=extra_tags)
+                type_invoice=TYPE_INVOICE, extra_tags=extra_tags,
+                sel_corrs=[corr.get(c, f"#{c}") for c in sorted(corr_ids, key=lambda c: corr.get(c, "").lower())])
 
 
 @app.route("/execute", methods=["POST"])

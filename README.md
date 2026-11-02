@@ -30,7 +30,8 @@ Aufruf: `http://<server-ip>:8085`
 Der Token-Benutzer braucht in Paperless Rechte zum Anzeigen, Ändern, Hinzufügen und Löschen von Dokumenten.
 
 ## Bedienung
-1. **Zeitraum** (Rechnungsdatum von/bis) eingeben und **Tags** für die neuen Dokumente wählen
+1. **Zeitraum** (Rechnungsdatum von/bis) eingeben, optional **Korrespondenten** auswählen
+   (nichts gewählt = alle; Lieferscheine ohne Korrespondent können mit durchsucht werden) und **Tags** für die neuen Dokumente wählen
    (alle vorhandenen Paperless-Tags, „Posteingang“ ist vorausgewählt). „Lieferscheine zusätzlich X Tage vorher“
    erweitert die Suche nach hinten, weil die Lieferung meist vor der Rechnung liegt.
 2. **Prüfseite**: Jede Rechnung mit Vorschaubild und vorgeschlagenen Lieferscheinen.
