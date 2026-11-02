@@ -22,6 +22,12 @@ services:
       # vorausgewählte Tags für die neuen Dokumente (kommagetrennt, im Formular änderbar)
       DEFAULT_TAGS: "Posteingang"
       FALLBACK_DAYS: "45"
+      # Vorgaben für die Suche nach Rechnungen zu nicht zugeordneten Lieferscheinen
+      SEARCH_DOCTYPES: "Rechnung"        # Dokumententypen, kommagetrennt
+      SEARCH_DAYS_BEFORE: "30"           # Tage vor dem Lieferscheindatum
+      SEARCH_DAYS_AFTER: "365"           # Tage nach dem Lieferscheindatum
+      SEARCH_UNLIMITED: "false"          # true = ohne Zeitbegrenzung
+      SEARCH_SAME_CORR: "true"           # nur beim gleichen Korrespondenten
       DEFAULT_LOOKBACK_DAYS: "60"
       TZ: "Europe/Berlin"
       # optionaler Login für die Oberfläche

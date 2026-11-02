@@ -35,6 +35,12 @@ VERIFY_SSL = os.environ.get("VERIFY_SSL", "true").lower() not in ("0", "false", 
 APP_USER = os.environ.get("APP_USER")
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 AUTO_CLEAN_TITLES = os.environ.get("AUTO_CLEAN_TITLES", "true").lower() not in ("0", "false", "no")
+# Vorgaben für die Suche nach Rechnungen zu nicht zugeordneten Lieferscheinen
+SEARCH_DOCTYPES = [t.strip() for t in os.environ.get("SEARCH_DOCTYPES", TYPE_INVOICE).split(",") if t.strip()]
+SEARCH_DAYS_BEFORE = int(os.environ.get("SEARCH_DAYS_BEFORE", "30"))
+SEARCH_DAYS_AFTER = int(os.environ.get("SEARCH_DAYS_AFTER", "365"))
+SEARCH_UNLIMITED = os.environ.get("SEARCH_UNLIMITED", "false").lower() in ("1", "true", "yes")
+SEARCH_SAME_CORR = os.environ.get("SEARCH_SAME_CORR", "true").lower() not in ("0", "false", "no")
 PLAN_TTL = 3600  # Sekunden, wie lange ein Vorschlag gültig bleibt
 
 
@@ -113,6 +119,30 @@ class Paperless:
             docs = self.all("/api/documents/", **params)
             return [d for d in docs if d.get("correspondent") in corr_ids]
         return self.all("/api/documents/", **params)
+
+    def doc_types(self):
+        return sorted(self.all("/api/document_types/"), key=lambda t: t["name"].lower())
+
+    def find_docs(self, type_ids, start=None, end=None, corr_id=None, content=None):
+        """Dokumente bestimmter Typen, optional nach Zeitraum, Korrespondent und Textinhalt gefiltert."""
+        params = {"fields": "id,title,correspondent,created,content,tags,archive_serial_number,document_type",
+                  "ordering": "created"}
+        if type_ids:
+            params["document_type__id__in"] = ",".join(map(str, sorted(type_ids)))
+        if start:
+            params["created__gte"] = start.isoformat()
+        if end:
+            params["created__lt"] = (end + dt.timedelta(days=1)).isoformat()
+        if corr_id:
+            params["correspondent__id"] = corr_id
+        if content:
+            params["content__icontains"] = content
+        docs = self.all("/api/documents/", **params)
+        if type_ids:  # absichern, falls ein Filter vom Server ignoriert wird
+            docs = [d for d in docs if d.get("document_type") in type_ids]
+        if corr_id:
+            docs = [d for d in docs if d.get("correspondent") == corr_id]
+        return docs
 
     def correspondent_list(self):
         return sorted(self.all("/api/correspondents/"), key=lambda c: c["name"].lower())
@@ -247,6 +277,7 @@ def summarize(doc, corr):
         "title": doc.get("title") or f"Dokument {doc['id']}",
         "date": _date(doc).isoformat(),
         "correspondent": corr.get(doc.get("correspondent"), "–"),
+        "corr_id": doc.get("correspondent"),
         "asn": doc.get("archive_serial_number"),
         "tags": doc.get("tags") or [],
     }
@@ -361,6 +392,50 @@ def build_plan(invoices, deliveries, corr, inv_start):
     return {"groups": groups, "without": without, "unassigned": unassigned}
 
 
+# --------------------------------------------------------------------------- Suche nach Rechnungen zu Lieferscheinen
+def search_variants(num):
+    """Suchbegriffe für die Textsuche in Paperless: Nummer, OCR-Form und die letzten 5 Ziffern."""
+    out = []
+    for v in (num.upper(), ocr_norm(num)):
+        if len(v) >= 4 and v not in out:
+            out.append(v)
+    tail = ocr_norm(num)[-5:]
+    if len(ocr_norm(num)) >= 7 and tail.isdigit() and tail not in out:
+        out.append(tail)  # fängt Fälle wie "4LI123456" in der Rechnung bei Suche nach "411123456"
+    return out
+
+
+def search_invoices_for(pl, ls, nums, type_ids, before, after, unlimited, same_corr, limit=25):
+    """Sucht Dokumente, deren Text eine der Nummern enthält. Rückgabe: Liste (dokument, nummer, ocr_tolerant)."""
+    ldate = dt.date.fromisoformat(ls["date"])
+    start = None if unlimited else ldate - dt.timedelta(days=before)
+    end = None if unlimited else ldate + dt.timedelta(days=after)
+    corr_id = ls.get("corr_id") if same_corr else None
+    cands = {}
+    if same_corr and corr_id:
+        for d in pl.find_docs(type_ids, start, end, corr_id=corr_id):
+            cands[d["id"]] = d
+    else:
+        for n in nums:
+            for v in search_variants(n):
+                for d in pl.find_docs(type_ids, start, end, content=v):
+                    cands[d["id"]] = d
+    hits = []
+    for d in cands.values():
+        if d["id"] == ls["id"]:
+            continue
+        text = f"{d.get('title', '')}\n{d.get('content', '')}".upper()
+        for n in nums:
+            if contains_number(text, n.upper()):
+                hits.append((d, n, False))
+                break
+            if contains_number(text.translate(OCR_MAP), ocr_norm(n)):
+                hits.append((d, n, True))
+                break
+    hits.sort(key=lambda h: abs((_date(h[0]) - ldate).days))
+    return hits[:limit]
+
+
 # --------------------------------------------------------------------------- Web-Oberfläche
 def require_auth(f):
     @wraps(f)
@@ -410,7 +485,7 @@ h3{margin:0 0 12px;font-size:1.05rem;font-weight:650}
 .chip .cnt{font-style:normal;opacity:.6;font-size:.78rem;margin-left:6px}
 .linkbtn{background:none;border:0;box-shadow:none;color:var(--accent);padding:0;font-size:.85rem;font-weight:600;cursor:pointer}
 label.f{display:block;margin:0 0 6px;font-size:.85rem;font-weight:600;color:var(--muted)}
-input[type=date],input[type=number],input[type=search],select{width:100%;padding:10px 12px;font:inherit;color:var(--text);
+input[type=date],input[type=number],input[type=search],input[type=text],select{width:100%;padding:10px 12px;font:inherit;color:var(--text);
   background:var(--surface2);border:1px solid var(--line);border-radius:10px;outline:none}
 input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
 .switch{display:flex;gap:10px;align-items:center;margin-top:14px;cursor:pointer;font-weight:500}
@@ -449,6 +524,12 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.ulist{display:flex;flex-direction:column;gap:2px;margin-top:8px}
+.urow{display:flex;gap:12px;align-items:center;padding:8px 6px;border-radius:10px;cursor:pointer}
+.urow:hover{background:var(--surface2)}
+.urow .num{margin-left:6px}
+.lshead{display:flex;gap:14px;align-items:flex-start}
+.nomatch{padding:12px 0 4px 32px}
 .nums{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px;font-size:.82rem}
 .nums .nl{color:var(--muted);margin-right:2px}
 .num{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.8rem;padding:1px 8px;border-radius:6px;
@@ -572,7 +653,9 @@ PREVIEW = """
     <div><span class="badge {{ i.level }}">{{ i.level }}</span> <b>{{ i.title }}</b><br>
       <span class="meta">{{ i.date|de }} · {{ i.correspondent }} · {{ i.reason }}</span>
       <div class="nums"><span class="nl">Erkannte Nr.:</span>
-        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}</div></div>
+        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}
+        {% if i.level == 'unsicher' %}<button type="submit" class="linkbtn" formaction="{{ url_for('search_ls') }}"
+          name="find_ls" value="{{ i.id }}" data-search1>🔍 Rechnung in Paperless suchen</button>{% endif %}</div></div>
   </div>
   {% endfor %}
   {% if g['items'] %}</div>{% endif %}
@@ -591,10 +674,16 @@ PREVIEW = """
 <div class="groups">{% for g in plan.without %}{{ group(g) }}{% endfor %}</div></details>
 {% endif %}
 {% if plan.unassigned %}
-<details class="card"><summary><b>{{ plan.unassigned|length }} nicht zugeordnete Lieferscheine</b></summary>
-<ul>{% for u in plan.unassigned %}<li><a href="{{ link(u.id) }}" target="_blank">{{ u.title }}</a>
+<details class="card" {{ 'open' if open_unassigned }}><summary><b>{{ plan.unassigned|length }} nicht zugeordnete Lieferscheine</b></summary>
+<p class="meta">Lieferscheine anhaken und in der ganzen Paperless-Instanz nach Rechnungen suchen lassen, die deren Nummer enthalten.</p>
+<div class="ulist">{% for u in plan.unassigned %}<label class="urow"><input type="checkbox" name="find_ls" value="{{ u.id }}" class="findls">
+  <span><a href="{{ link(u.id) }}" target="_blank">{{ u.title }}</a>
   <span class="meta">{{ u.date|de }} · {{ u.correspondent }}</span>
-  {% for x in u.nums %}<span class="num">{{ x.n }}</span>{% else %}<span class="none">keine Nr. erkannt</span>{% endfor %}</li>{% endfor %}</ul></details>
+  {% for x in u.nums %}<span class="num">{{ x.n }}</span>{% else %}<span class="none">keine Nr. erkannt</span>{% endfor %}</span></label>{% endfor %}</div>
+<div style="margin-top:12px;display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+  <button type="button" class="linkbtn" id="findall">alle auswählen</button>
+  <button type="submit" class="sec" formaction="{{ url_for('search_ls') }}" data-search>🔍 Ausgewählte in Paperless suchen</button></div>
+</details>
 {% endif %}
 
 <div class="card bar"><a class="btn sec" href="{{ url_for('index') }}">← Abbrechen</a>
@@ -605,7 +694,17 @@ document.querySelectorAll('.ls,.add').forEach(el => el.addEventListener('change'
   const inv = document.querySelector('.inv[value="' + el.dataset.inv + '"]');
   if (el.checked || (el.selectedOptions && el.selectedOptions.length)) inv.checked = true;
 }));
+const fa = document.getElementById('findall');
+if (fa) fa.addEventListener('click', () => document.querySelectorAll('.findls').forEach(c => c.checked = true));
 document.getElementById('f').addEventListener('submit', e => {
+  if (e.submitter && e.submitter.hasAttribute('data-search1')) {
+    document.querySelectorAll('.findls').forEach(c => c.checked = false);
+    return;
+  }
+  if (e.submitter && e.submitter.hasAttribute('data-search')) {
+    if (!document.querySelectorAll('.findls:checked').length) { alert('Bitte mindestens einen Lieferschein anhaken.'); e.preventDefault(); }
+    return;
+  }
   let n = 0;
   document.querySelectorAll('.inv:checked').forEach(inv => {
     const id = inv.value;
@@ -619,6 +718,88 @@ document.getElementById('f').addEventListener('submit', e => {
 </script>
 """
 
+SEARCH = """
+{% if error %}<div class="card err">{{ error }}</div>{% endif %}
+<form class="card" method="post" action="{{ url_for('search_ls') }}">
+ <input type="hidden" name="plan" value="{{ plan_id }}"><input type="hidden" name="run" value="1">
+ {% for l in lss %}<input type="hidden" name="find_ls" value="{{ l.id }}">{% endfor %}
+ <h3>🔍 Rechnungen zu Lieferscheinen suchen</h3>
+ <p class="meta" style="margin-top:0">Durchsucht die ganze Paperless-Instanz nach Dokumenten, deren Text die Lieferscheinnummer enthält
+   (auch OCR-tolerant, z. B. LI ↔ 11).</p>
+ <div class="cols">
+  <section>
+   <h3>Lieferscheine &amp; gesuchte Nummern</h3>
+   {% for l in lss %}
+   <div class="lshead" style="margin-bottom:14px">
+     <a href="{{ link(l.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=l.id) }}"></a>
+     <div style="flex:1;min-width:0"><b>{{ l.title }}</b><br><span class="meta">{{ l.date|de }} · {{ l.correspondent }}</span>
+       <label class="f" style="margin-top:8px">Gesuchte Nummern (mehrere mit Komma trennen)</label>
+       <input type="text" name="nums_{{ l.id }}" value="{{ nums[l.id]|join(', ') }}" placeholder="z. B. 4LI123456"></div>
+   </div>
+   {% endfor %}
+  </section>
+  <section>
+   <h3>Vorgaben</h3>
+   <label class="f">In diesen Dokumententypen suchen</label>
+   <div class="chips">{% for t in types %}<label class="chip plain"><input type="checkbox" name="stype" value="{{ t.id }}"
+     {{ 'checked' if t.id in sel_types }}><span>{{ t.name }}</span></label>{% endfor %}</div>
+   <div class="grid2" style="margin-top:14px">
+     <div><label class="f">Tage vor dem Lieferscheindatum</label><input type="number" name="before" value="{{ before }}" min="0" max="3650"></div>
+     <div><label class="f">Tage nach dem Lieferscheindatum</label><input type="number" name="after" value="{{ after }}" min="0" max="3650"></div>
+   </div>
+   <label class="switch"><input type="checkbox" name="unlimited" value="1" {{ 'checked' if unlimited }}> ohne Zeitbegrenzung suchen</label>
+   <label class="switch"><input type="checkbox" name="same_corr" value="1" {{ 'checked' if same_corr }}> nur beim gleichen Korrespondenten suchen</label>
+   <p class="meta">Lieferscheine ohne Korrespondent werden immer bei allen Korrespondenten gesucht.</p>
+  </section>
+ </div>
+ <div style="margin-top:20px;display:flex;gap:12px;flex-wrap:wrap">
+   <button>Suchen</button><a class="btn sec" href="{{ url_for('review', plan_id=plan_id) }}">← Zurück zur Prüfseite</a></div>
+</form>
+
+{% if results is not none %}
+<form method="post" action="{{ url_for('search_merge') }}" id="sf">
+<input type="hidden" name="sid" value="{{ sid }}">
+<div class="groups">
+{% for l in lss %}{% set hits = results[l.id] %}
+<div class="card">
+  <div class="grp-head">
+    <a href="{{ link(l.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=l.id) }}"></a>
+    <div><span class="tag">Lieferschein</span> <b>{{ l.title }}</b><br>
+      <span class="meta">{{ l.date|de }} · {{ l.correspondent }}</span>
+      <div class="nums"><span class="nl">Gesucht:</span>{% for n in nums[l.id] %}<span class="num">{{ n }}</span>{% else %}<span class="none">keine Nummer</span>{% endfor %}</div></div>
+  </div>
+  <div class="items">
+  {% for h in hits %}
+  <label class="row" style="cursor:pointer">
+    <input type="radio" name="target_{{ l.id }}" value="{{ h.id }}" {{ 'checked' if hits|length == 1 }}>
+    <a href="{{ link(h.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=h.id) }}"></a>
+    <div><span class="tag">{{ h.type }}</span> <b>{{ h.title }}</b><br>
+      <span class="meta">{{ h.date|de }} · {{ h.correspondent }} · {{ h.delta }}</span>
+      <div class="nums"><span class="nl">Gefunden:</span><span class="num hit">{{ h.match }}</span>
+        {% if h.fuzzy %}<span class="meta">(OCR-tolerant)</span>{% endif %}</div></div>
+  </label>
+  {% else %}
+  <div class="nomatch meta">Keine passende Rechnung gefunden. Nummer prüfen oder die Vorgaben erweitern.</div>
+  {% endfor %}
+  {% if hits %}<label class="row" style="cursor:pointer"><input type="radio" name="target_{{ l.id }}" value="" {{ 'checked' if hits|length != 1 }}>
+    <span class="meta">nicht zuordnen</span></label>{% endif %}
+  </div>
+</div>
+{% endfor %}
+</div>
+<div class="card bar"><span class="meta">Rechnung zuerst, danach die Lieferscheine – Tags und Originale wie auf der Startseite gewählt.</span>
+  <button type="submit">Ausgewählte zusammenführen</button></div>
+</form>
+<script>
+document.getElementById('sf').addEventListener('submit', e => {
+  const n = [...document.querySelectorAll('#sf input[type=radio]:checked')].filter(r => r.value).length;
+  if (!n) { alert('Keine Rechnung ausgewählt.'); e.preventDefault(); return; }
+  if (!confirm(n + ' Lieferschein(e) jetzt mit der gewählten Rechnung zusammenführen?')) e.preventDefault();
+});
+</script>
+{% endif %}
+"""
+
 RESULT = """
 <div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Ergebnis</h3>
   {{ done|length }} Zusammenführung(en) an Paperless übergeben{% if errors %}, {{ errors|length }} Fehler{% endif %}.
@@ -630,7 +811,9 @@ RESULT = """
     sobald Paperless die neuen Dokumente angelegt hat (bis zu 5 Minuten).</p>{% endif %}
   <form method="post" action="{{ url_for('cleanup_titles') }}" style="display:inline">
     <button class="sec">„(merged)“ jetzt aus allen Titeln entfernen</button></form>
-  <p style="margin-top:14px"><a class="btn" href="{{ url_for('index') }}">Neuer Durchlauf</a></p></div>
+  <p style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
+    {% if back %}<a class="btn sec" href="{{ url_for('review', plan_id=back) }}">← Zurück zur Prüfseite</a>{% endif %}
+    <a class="btn" href="{{ url_for('index') }}">Neuer Durchlauf</a></p></div>
 """
 
 
@@ -710,13 +893,199 @@ def preview():
     plan["without"] = [g for g in plan["without"] if g["inv"]["date"] <= end.isoformat()]
 
     plan_id = uuid.uuid4().hex
+    stored = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals,
+              "extra_tags": [t["id"] for t in extra_tags],
+              "view": {"start": start, "end": end, "extra_tags": extra_tags,
+                       "sel_corrs": [corr.get(c, f"#{c}") for c in
+                                     sorted(corr_ids, key=lambda c: corr.get(c, "").lower())]}}
     with PLANS_LOCK:
-        PLANS[plan_id] = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals,
-                          "extra_tags": [t["id"] for t in extra_tags]}
-    return page(PREVIEW, plan=plan, plan_id=plan_id, start=start, end=end,
-                delete_originals=delete_originals, public=PAPERLESS_PUBLIC_URL, link=doc_link,
-                type_invoice=TYPE_INVOICE, extra_tags=extra_tags,
-                sel_corrs=[corr.get(c, f"#{c}") for c in sorted(corr_ids, key=lambda c: corr.get(c, "").lower())])
+        PLANS[plan_id] = stored
+    return render_review(plan_id, stored)
+
+
+def render_review(plan_id, stored, open_unassigned=False):
+    v = stored["view"]
+    return page(PREVIEW, plan=stored["plan"], plan_id=plan_id, start=v["start"], end=v["end"],
+                delete_originals=stored["delete_originals"], public=PAPERLESS_PUBLIC_URL, link=doc_link,
+                type_invoice=TYPE_INVOICE, extra_tags=v["extra_tags"], sel_corrs=v["sel_corrs"],
+                open_unassigned=open_unassigned)
+
+
+def _get_plan(plan_id):
+    _cleanup_plans()
+    with PLANS_LOCK:
+        stored = PLANS.get(plan_id or "")
+        if stored:
+            stored["ts"] = time.time()  # Prüfseite bleibt gültig, solange daran gearbeitet wird
+        return stored
+
+
+@app.route("/review/<plan_id>")
+@require_auth
+def review(plan_id):
+    stored = _get_plan(plan_id)
+    if not stored or "plan" not in stored:
+        return index(error="Der Vorschlag ist abgelaufen oder wurde schon ausgeführt. Bitte neu suchen.")
+    return render_review(plan_id, stored, open_unassigned=True)
+
+
+@app.route("/search-ls", methods=["POST"])
+@require_auth
+def search_ls():
+    plan_id = request.form.get("plan", "")
+    stored = _get_plan(plan_id)
+    if not stored or "plan" not in stored:
+        return index(error="Der Vorschlag ist abgelaufen oder wurde schon ausgeführt. Bitte neu suchen.")
+    p = stored["plan"]
+    pool = {i["id"]: i for g in p["groups"] + p["without"] for i in g["items"]}
+    pool.update({u["id"]: u for u in p["unassigned"]})
+    lss = [pool[i] for i in dict.fromkeys(int(x) for x in request.form.getlist("find_ls") if x.isdigit()) if i in pool]
+    if not lss:
+        return render_review(plan_id, stored, open_unassigned=True)
+    run = request.form.get("run") == "1"
+
+    try:
+        pl = Paperless()
+        types = pl.doc_types()
+    except Exception as e:  # noqa: BLE001
+        return index(error=f"Fehler bei der Abfrage von Paperless: {e}")
+    type_names = {t["id"]: t["name"] for t in types}
+
+    if run:
+        sel_types = {int(x) for x in request.form.getlist("stype") if x.isdigit()}
+        before = max(0, int(request.form.get("before") or 0))
+        after = max(0, int(request.form.get("after") or 0))
+        unlimited = request.form.get("unlimited") == "1"
+        same_corr = request.form.get("same_corr") == "1"
+        nums = {}
+        for l in lss:
+            raw = request.form.get(f"nums_{l['id']}", "")
+            nums[l["id"]] = list(dict.fromkeys(x.strip().upper() for x in re.split(r"[,;\s]+", raw) if x.strip()))
+    else:
+        wanted = {n.lower() for n in SEARCH_DOCTYPES}
+        sel_types = {t["id"] for t in types if t["name"].lower() in wanted}
+        before, after = SEARCH_DAYS_BEFORE, SEARCH_DAYS_AFTER
+        unlimited, same_corr = SEARCH_UNLIMITED, SEARCH_SAME_CORR
+        nums = {l["id"]: [x["n"] for x in l.get("nums", [])] for l in lss}
+
+    ctx = dict(plan_id=plan_id, lss=lss, nums=nums, types=types, sel_types=sel_types, before=before,
+               after=after, unlimited=unlimited, same_corr=same_corr, link=doc_link, results=None, sid=None,
+               error=None)
+    if not run:
+        return page(SEARCH, **ctx)
+    if not sel_types:
+        ctx["error"] = "Bitte mindestens einen Dokumententyp auswählen."
+        return page(SEARCH, **ctx)
+
+    try:
+        corr = pl.correspondents()
+        results, docs = {}, {}
+        for l in lss:
+            hits = []
+            if nums[l["id"]]:
+                for d, n, fuzzy in search_invoices_for(pl, l, nums[l["id"]], sel_types, before, after,
+                                                       unlimited, same_corr and bool(l.get("corr_id"))):
+                    summ = summarize(d, corr)
+                    docs[d["id"]] = summ
+                    delta = (_date(d) - dt.date.fromisoformat(l["date"])).days
+                    hits.append({**summ, "type": type_names.get(d.get("document_type"), "–"), "match": n,
+                                 "fuzzy": fuzzy,
+                                 "delta": "gleicher Tag" if delta == 0 else
+                                 f"{abs(delta)} Tag(e) {'nach' if delta > 0 else 'vor'} dem Lieferschein"})
+            results[l["id"]] = hits
+    except Exception as e:  # noqa: BLE001
+        ctx["error"] = f"Fehler bei der Suche in Paperless: {e}"
+        return page(SEARCH, **ctx)
+
+    sid = uuid.uuid4().hex
+    with PLANS_LOCK:
+        PLANS[sid] = {"ts": time.time(), "search": True, "plan_id": plan_id, "docs": docs,
+                      "ls": {l["id"]: l for l in lss},
+                      "delete_originals": stored["delete_originals"], "extra_tags": stored["extra_tags"]}
+    ctx.update(results=results, sid=sid)
+    return page(SEARCH, **ctx)
+
+
+@app.route("/search-ls/merge", methods=["POST"])
+@require_auth
+def search_merge():
+    with PLANS_LOCK:
+        st = PLANS.pop(request.form.get("sid", ""), None)
+    if not st or not st.get("search"):
+        return index(error="Das Suchergebnis ist abgelaufen oder wurde schon ausgeführt. Bitte neu suchen.")
+    targets = {}
+    for lid in st["ls"]:
+        v = request.form.get(f"target_{lid}", "")
+        if v.isdigit() and int(v) in st["docs"]:
+            targets.setdefault(int(v), []).append(lid)
+    jobs = [(st["docs"][doc_id], sorted(lids, key=lambda x: (st["ls"][x]["date"], x)))
+            for doc_id, lids in targets.items()]
+    if not jobs:
+        return index(error="Es wurde keine Rechnung ausgewählt.")
+    done, errors = perform_merges(jobs, st["ls"], st["delete_originals"], st["extra_tags"])
+
+    # verwendete Lieferscheine aus der Prüfseite entfernen; betroffene Rechnungen dort sperren
+    merged_ls = {lid for _, lids in jobs for lid in lids}
+    used_docs = set(targets)
+    with PLANS_LOCK:
+        plan_st = PLANS.get(st["plan_id"])
+        if plan_st and "plan" in plan_st:
+            p = plan_st["plan"]
+            p["unassigned"] = [u for u in p["unassigned"] if u["id"] not in merged_ls]
+            for g in p["groups"] + p["without"]:
+                g["items"] = [i for i in g["items"] if i["id"] not in merged_ls]
+            if any(g["inv"]["id"] in used_docs for g in p["groups"] + p["without"]):
+                PLANS.pop(st["plan_id"], None)  # Rechnung hat sich geändert -> Prüfseite neu erstellen
+    return page(RESULT, done=done, errors=errors, auto_clean=AUTO_CLEAN_TITLES,
+                back=st["plan_id"] if st["plan_id"] in PLANS else None)
+
+
+def perform_merges(jobs, known_ls, delete_originals, extra):
+    """Führt die Zusammenführungen aus. jobs: [(rechnung_summary, [lieferschein_ids])]."""
+    pl = Paperless()
+    done, errors, tag_ls = [], [], []
+    try:
+        done_tag_id = pl.id_by_name("/api/tags/", DONE_TAG)
+    except Exception:  # noqa: BLE001
+        done_tag_id = None
+    for inv, ls_ids in jobs:
+        # Das neue Dokument übernimmt die Tags der Rechnung. Damit es auch die Tags der Lieferscheine
+        # und die gewählten Zusatz-Tags bekommt, werden diese vorher an die Rechnung gehängt.
+        wanted = []
+        for t in [*(t for lid in ls_ids for t in known_ls[lid].get("tags", [])), *extra]:
+            if t not in wanted and t not in inv.get("tags", []) and t != done_tag_id:
+                wanted.append(t)
+        add_now = wanted
+        try:
+            if add_now:
+                pl.modify_tags([inv["id"]], add=add_now)
+            if clean_title(inv["title"]) != inv["title"]:  # sonst entsteht "(merged) (merged)"
+                pl.send("PATCH", f"/api/documents/{inv['id']}/", {"title": clean_title(inv["title"])})
+            pl.merge([inv["id"]] + ls_ids, inv["id"], delete_originals)
+            done.append({"title": clean_title(inv["title"]), "count": len(ls_ids)})
+            tag_ls.extend(ls_ids)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{inv['title']}: {e}")
+            if add_now:  # nichts zusammengeführt -> Rechnung wieder wie vorher
+                try:
+                    pl.modify_tags([inv["id"]], remove=add_now)
+                except Exception:  # noqa: BLE001
+                    pass
+            continue
+        if add_now and not delete_originals:
+            try:  # Original-Rechnung bleibt erhalten -> dort die Zusatz-Tags wieder entfernen
+                pl.modify_tags([inv["id"]], remove=add_now)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{inv['title']}: übernommene Tags am Original nicht entfernt: {e}")
+
+    if tag_ls and not delete_originals:
+        try:
+            pl.add_tag(tag_ls, pl.ensure_tag(DONE_TAG))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"Tag „{DONE_TAG}“ konnte nicht gesetzt werden: {e}")
+    if done and AUTO_CLEAN_TITLES:
+        threading.Thread(target=_auto_clean_titles, args=(len(done),), daemon=True).start()
+    return done, errors
 
 
 @app.route("/execute", methods=["POST"])
@@ -724,7 +1093,7 @@ def preview():
 def execute():
     with PLANS_LOCK:
         stored = PLANS.pop(request.form.get("plan", ""), None)
-    if not stored:
+    if not stored or "plan" not in stored:
         return index(error="Der Vorschlag ist abgelaufen oder wurde schon ausgeführt. Bitte neu suchen.")
     plan = stored["plan"]
     all_groups = {g["inv"]["id"]: g for g in plan["groups"] + plan["without"]}
@@ -750,50 +1119,7 @@ def execute():
         ls_ids.sort(key=lambda x: (known_ls[x]["date"], x))
         jobs.append((all_groups[inv_id]["inv"], ls_ids))
 
-    pl = Paperless()
-    done, errors, tag_ls = [], [], []
-    extra = stored.get("extra_tags", [])
-    try:
-        done_tag_id = pl.id_by_name("/api/tags/", DONE_TAG)
-    except Exception:  # noqa: BLE001
-        done_tag_id = None
-    for inv, ls_ids in jobs:
-        # Das neue Dokument übernimmt die Tags der Rechnung. Damit es auch die Tags der Lieferscheine
-        # und die gewählten Zusatz-Tags bekommt, werden diese vorher an die Rechnung gehängt.
-        wanted = []
-        for t in [*(t for lid in ls_ids for t in known_ls[lid].get("tags", [])), *extra]:
-            if t not in wanted and t not in inv.get("tags", []) and t != done_tag_id:
-                wanted.append(t)
-        add_now = wanted
-        try:
-            if add_now:
-                pl.modify_tags([inv["id"]], add=add_now)
-            if clean_title(inv["title"]) != inv["title"]:  # sonst entsteht "(merged) (merged)"
-                pl.send("PATCH", f"/api/documents/{inv['id']}/", {"title": clean_title(inv["title"])})
-            pl.merge([inv["id"]] + ls_ids, inv["id"], stored["delete_originals"])
-            done.append({"title": clean_title(inv["title"]), "count": len(ls_ids)})
-            tag_ls.extend(ls_ids)
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"{inv['title']}: {e}")
-            if add_now:  # nichts zusammengeführt -> Rechnung wieder wie vorher
-                try:
-                    pl.modify_tags([inv["id"]], remove=add_now)
-                except Exception:  # noqa: BLE001
-                    pass
-            continue
-        if add_now and not stored["delete_originals"]:
-            try:  # Original-Rechnung bleibt erhalten -> dort die Zusatz-Tags wieder entfernen
-                pl.modify_tags([inv["id"]], remove=add_now)
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"{inv['title']}: übernommene Tags am Original nicht entfernt: {e}")
-
-    if tag_ls and not stored["delete_originals"]:
-        try:
-            pl.add_tag(tag_ls, pl.ensure_tag(DONE_TAG))
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"Tag „{DONE_TAG}“ konnte nicht gesetzt werden: {e}")
-    if done and AUTO_CLEAN_TITLES:
-        threading.Thread(target=_auto_clean_titles, args=(len(done),), daemon=True).start()
+    done, errors = perform_merges(jobs, known_ls, stored["delete_originals"], stored.get("extra_tags", []))
     return page(RESULT, done=done, errors=errors, auto_clean=AUTO_CLEAN_TITLES)
 
 

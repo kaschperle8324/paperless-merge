@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.5** · [Änderungen](#versionen)
+**Aktuelle Version: 0.6** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -11,6 +11,7 @@ zu **einem PDF** zusammenführt:
 - **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
+- **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
 
 Die Erweiterung läuft als eigener Docker-Container neben Paperless und arbeitet ausschließlich über
 die Paperless-API. Paperless selbst wird nicht verändert.
@@ -25,6 +26,7 @@ die Paperless-API. Paperless selbst wird nicht verändert.
   - [1. Startseite](#1-startseite)
   - [2. Prüfseite](#2-prüfseite)
   - [3. Zusammenführen und Ergebnis](#3-zusammenführen-und-ergebnis)
+  - [4. Rechnungen zu Lieferscheinen suchen](#4-rechnungen-zu-lieferscheinen-suchen)
 - [Was mit den Originalen passiert](#was-mit-den-originalen-passiert)
 - [Wie die Zuordnung funktioniert](#wie-die-zuordnung-funktioniert)
 - [Einstellungen](#einstellungen)
@@ -169,6 +171,37 @@ Die Leiste mit **Abbrechen** und **Ausgewählte zusammenführen** bleibt beim Sc
     Startseite den Knopf **Titel bereinigen** für die nachträgliche Bereinigung.
 - Ein Vorschlag ist **eine Stunde** gültig und kann nur **einmal** ausgeführt werden – danach neu suchen.
 
+### 4. Rechnungen zu Lieferscheinen suchen
+Lieferscheine, zu denen im gewählten Zeitraum keine Rechnung gefunden wurde, können gezielt in der
+**ganzen Paperless-Instanz** gesucht werden – auch weit außerhalb des Zeitraums und auch in Dokumenten,
+die schon einmal zusammengeführt wurden.
+
+**Starten**
+- Auf der Prüfseite unter **nicht zugeordnete Lieferscheine** die gewünschten Lieferscheine anhaken
+  (*alle auswählen* markiert alle) und **🔍 Ausgewählte in Paperless suchen** klicken.
+- Bei Lieferscheinen mit nur einem *unsicheren* Vorschlag steht direkt der Knopf **🔍 Rechnung in Paperless suchen**.
+
+**Vorgaben** (vorbelegt mit den Werten aus der `docker-compose.yml`, siehe [Einstellungen](#einstellungen))
+| Vorgabe | Bedeutung |
+|---|---|
+| Gesuchte Nummern | je Lieferschein vorbelegt mit den erkannten Nummern – **änderbar**, z. B. wenn die OCR die Nummer falsch gelesen hat. Mehrere Nummern mit Komma trennen. |
+| Dokumententypen | in welchen Typen gesucht wird (Standard: *Rechnung*), z. B. zusätzlich *Gutschrift* |
+| Tage vor / nach dem Lieferscheindatum | Zeitfenster rund um das Lieferscheindatum (Standard: 30 Tage vorher bis 365 Tage nachher) |
+| ohne Zeitbegrenzung suchen | ignoriert das Zeitfenster und durchsucht alle Dokumente |
+| nur beim gleichen Korrespondenten suchen | schränkt auf den Korrespondenten des Lieferscheins ein. Lieferscheine ohne Korrespondent werden immer bei allen gesucht. |
+
+**Ergebnis**
+- Für jeden Lieferschein werden die gefundenen Dokumente angezeigt – mit Typ, Datum, Korrespondent,
+  Abstand zum Lieferscheindatum und der **gefundenen Nummer** (grün, ggf. mit Hinweis *OCR-tolerant*).
+- Die Treffer sind nach Nähe zum Lieferscheindatum sortiert. Gibt es genau einen Treffer, ist er vorausgewählt,
+  sonst steht die Auswahl auf *nicht zuordnen*.
+- Vorgaben ändern und **Suchen** startet die Suche neu.
+- **Ausgewählte zusammenführen** führt jeden Lieferschein mit dem gewählten Dokument zusammen – nach denselben
+  Regeln wie oben: Rechnung zuerst, alle Tags, Originale wie auf der Startseite gewählt, „(merged)“ wird bereinigt.
+  Mehrere Lieferscheine zur selben Rechnung werden in einem Durchgang angehängt.
+- Danach geht es mit **← Zurück zur Prüfseite** weiter; die zugeordneten Lieferscheine sind dort entfernt.
+  Wurde eine Rechnung verwendet, die auch auf der Prüfseite steht, muss die Prüfseite neu erstellt werden.
+
 ---
 
 ## Was mit den Originalen passiert
@@ -225,6 +258,11 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `FALLBACK_DAYS` | `45` | Zeitfenster für *unsichere* Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
 | `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung für „Lieferscheine zusätzlich Tage vorher“ |
 | `VERIFY_SSL` | `true` | bei HTTPS mit selbstsigniertem Zertifikat auf `false` setzen |
+| `SEARCH_DOCTYPES` | `Rechnung` | Suche zu Lieferscheinen: vorausgewählte Dokumententypen, kommagetrennt |
+| `SEARCH_DAYS_BEFORE` | `30` | Suche zu Lieferscheinen: Tage vor dem Lieferscheindatum |
+| `SEARCH_DAYS_AFTER` | `365` | Suche zu Lieferscheinen: Tage nach dem Lieferscheindatum |
+| `SEARCH_UNLIMITED` | `false` | Suche zu Lieferscheinen: standardmäßig ohne Zeitbegrenzung |
+| `SEARCH_SAME_CORR` | `true` | Suche zu Lieferscheinen: standardmäßig nur beim gleichen Korrespondenten |
 | `AUTO_CLEAN_TITLES` | `true` | „(merged)“ nach dem Zusammenführen automatisch aus den Titeln entfernen |
 | `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche (beide setzen) |
 | `TZ` | – | Zeitzone, z. B. `Europe/Berlin` |
@@ -246,6 +284,13 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.6 (03.11.2026)
+- neue Funktion: **Rechnungen zu Lieferscheinen suchen** – nicht zugeordnete Lieferscheine auswählen und in der ganzen Paperless-Instanz nach Dokumenten suchen, die deren Nummer enthalten
+- Suchvorgaben (Dokumententypen, Zeitfenster, ohne Zeitbegrenzung, gleicher Korrespondent) mit Standardwerten aus der `docker-compose.yml`
+- gesuchte Nummern pro Lieferschein änderbar; Suche OCR-tolerant
+- Treffer direkt auswählen und zusammenführen; Suchknopf auch bei *unsicheren* Vorschlägen
+- Rückkehr zur Prüfseite nach der Suche
 
 ### Version 0.5 (03.11.2026)
 - Prüfseite zeigt bei jeder Rechnung die darin gefundenen Lieferscheinnummern
