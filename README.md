@@ -4,15 +4,6 @@ Erweiterung für **Paperless-ngx**: sucht Rechnungen und die passenden Liefersch
 wählbaren Zeitraum, zeigt die Zuordnung zur Kontrolle an und fügt sie erst nach Bestätigung zu
 einem PDF zusammen – **Rechnung als erste Seite**, das neue Dokument läuft als Typ **Rechnung**.
 
-## Einmalig: GitHub einrichten
-1. Auf GitHub ein neues Repository `paperless-merge` anlegen (privat oder öffentlich).
-2. Den Inhalt dieses Ordners hochladen (Web-Upload oder `git push`).
-3. Unter **Actions** startet der Build automatisch und legt das Image unter
-   `ghcr.io/<dein-name>/paperless-merge:latest` ab (amd64 + arm64).
-4. **Privates Repo:** Das Image ist dann ebenfalls privat. Entweder unter
-   *Profil → Packages → paperless-merge → Package settings* auf **Public** stellen
-   oder auf dem Server einmal anmelden:
-   `docker login ghcr.io -u <dein-name>` (Passwort = Personal Access Token mit `read:packages`).
 
 ## Auf dem Docker-Host
 Nur die `docker-compose.yml` anlegen, `DEIN-GITHUB-NAME`, `PAPERLESS_URL` und
