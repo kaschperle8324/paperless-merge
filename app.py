@@ -34,6 +34,7 @@ DEFAULT_LOOKBACK = int(os.environ.get("DEFAULT_LOOKBACK_DAYS", "60"))
 VERIFY_SSL = os.environ.get("VERIFY_SSL", "true").lower() not in ("0", "false", "no")
 APP_USER = os.environ.get("APP_USER")
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
+AUTO_CLEAN_TITLES = os.environ.get("AUTO_CLEAN_TITLES", "true").lower() not in ("0", "false", "no")
 PLAN_TTL = 3600  # Sekunden, wie lange ein Vorschlag gültig bleibt
 
 
@@ -139,6 +140,43 @@ class Paperless:
         return self.send("POST", "/api/documents/bulk_edit/", {
             "documents": doc_ids, "method": "add_tag", "parameters": {"tag": tag_id},
         })
+
+
+# --------------------------------------------------------------------------- Titel "(merged)"
+MERGED_RE = re.compile(r"\s*\(merged\)", re.I)
+
+
+def clean_title(title):
+    """Entfernt jedes "(merged)" aus einem Titel – auch mehrfach hintereinander."""
+    new = re.sub(r"\s{2,}", " ", MERGED_RE.sub("", title or "")).strip()
+    return new or title
+
+
+def clean_merged_titles(pl):
+    """Bereinigt alle Dokumente, deren Titel "(merged)" enthält. Rückgabe: (gefunden, bereinigt, Fehler)."""
+    docs = pl.all("/api/documents/", title__icontains="(merged)", fields="id,title")
+    fixed, errors = 0, []
+    for d in docs:
+        new = clean_title(d["title"])
+        if new == d["title"]:
+            continue
+        try:
+            pl.send("PATCH", f"/api/documents/{d['id']}/", {"title": new})
+            fixed += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{d['title']}: {e}")
+    return len(docs), fixed, errors
+
+
+def _auto_clean_titles(expected, timeout=300, interval=15):
+    """Läuft im Hintergrund, bis Paperless die neuen Dokumente angelegt hat, und bereinigt deren Titel."""
+    deadline, cleaned = time.time() + timeout, 0
+    while time.time() < deadline and cleaned < expected:
+        time.sleep(interval)
+        try:
+            cleaned += clean_merged_titles(Paperless())[1]
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --------------------------------------------------------------------------- Zuordnungslogik
@@ -454,6 +492,12 @@ INDEX = """
    <button>Suchen &amp; Vorschläge anzeigen →</button>
    <span class="meta">Es wird noch nichts verändert – im nächsten Schritt prüfst du alle Zuordnungen.</span></div>
 </form>
+<form class="card" method="post" action="{{ url_for('cleanup_titles') }}"
+      onsubmit="return confirm('„(merged)“ aus allen Dokumenttiteln in Paperless entfernen?')"
+      style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+  <button class="sec">Titel bereinigen</button>
+  <span class="meta">Entfernt nachträglich jedes „(merged)“ aus allen Dokumenttiteln in Paperless – auch mehrfache.</span>
+</form>
 <script>
 document.querySelectorAll('input.filter').forEach(f=>f.addEventListener('input',()=>{const q=f.value.toLowerCase();
   document.querySelectorAll('#'+f.dataset.target+' .chip').forEach(c=>c.style.display=c.dataset.name.includes(q)||c.querySelector('input').checked?'':'none')}));
@@ -550,9 +594,10 @@ RESULT = """
 {% for d in done %}<div class="card">✔ {{ d.title }} + {{ d.count }} Lieferschein(e)</div>{% endfor %}
 {% for e in errors %}<div class="card err">✘ {{ e }}</div>{% endfor %}
 <div class="card">
+  {% if auto_clean %}<p class="meta" style="margin-top:0">Der Titelzusatz „(merged)“ wird automatisch entfernt,
+    sobald Paperless die neuen Dokumente angelegt hat (bis zu 5 Minuten).</p>{% endif %}
   <form method="post" action="{{ url_for('cleanup_titles') }}" style="display:inline">
-    <button class="sec">Titelzusatz „(merged)“ entfernen</button></form>
-  <span class="meta">(nach ein, zwei Minuten, wenn Paperless fertig ist)</span>
+    <button class="sec">„(merged)“ jetzt aus allen Titeln entfernen</button></form>
   <p style="margin-top:14px"><a class="btn" href="{{ url_for('index') }}">Neuer Durchlauf</a></p></div>
 """
 
@@ -691,8 +736,10 @@ def execute():
         try:
             if add_now:
                 pl.modify_tags([inv["id"]], add=add_now)
+            if clean_title(inv["title"]) != inv["title"]:  # sonst entsteht "(merged) (merged)"
+                pl.send("PATCH", f"/api/documents/{inv['id']}/", {"title": clean_title(inv["title"])})
             pl.merge([inv["id"]] + ls_ids, inv["id"], stored["delete_originals"])
-            done.append({"title": inv["title"], "count": len(ls_ids)})
+            done.append({"title": clean_title(inv["title"]), "count": len(ls_ids)})
             tag_ls.extend(ls_ids)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{inv['title']}: {e}")
@@ -713,23 +760,19 @@ def execute():
             pl.add_tag(tag_ls, pl.ensure_tag(DONE_TAG))
         except Exception as e:  # noqa: BLE001
             errors.append(f"Tag „{DONE_TAG}“ konnte nicht gesetzt werden: {e}")
-    return page(RESULT, done=done, errors=errors)
+    if done and AUTO_CLEAN_TITLES:
+        threading.Thread(target=_auto_clean_titles, args=(len(done),), daemon=True).start()
+    return page(RESULT, done=done, errors=errors, auto_clean=AUTO_CLEAN_TITLES)
 
 
 @app.route("/cleanup-titles", methods=["POST"])
 @require_auth
 def cleanup_titles():
-    pl = Paperless()
-    t_inv = pl.id_by_name("/api/document_types/", TYPE_INVOICE)
-    docs = pl.all("/api/documents/", document_type__id=t_inv, title__iendswith="(merged)", fields="id,title")
-    errors = []
-    for d in docs:
-        new = re.sub(r"\s*\(merged\)\s*$", "", d["title"], flags=re.I)
-        try:
-            pl.send("PATCH", f"/api/documents/{d['id']}/", {"title": new})
-        except Exception as e:  # noqa: BLE001
-            errors.append(str(e))
-    msg = f"{len(docs) - len(errors)} Titel bereinigt." if docs else "Keine Dokumente mit „(merged)“ gefunden."
+    try:
+        found, fixed, errors = clean_merged_titles(Paperless())
+    except Exception as e:  # noqa: BLE001
+        return page(CLEANUP, msg=f"Fehler bei der Abfrage von Paperless: {e}", errors=[])
+    msg = f"{fixed} Titel bereinigt." if found else "Keine Dokumente mit „(merged)“ im Titel gefunden."
     return page(CLEANUP, msg=msg, errors=errors)
 
 

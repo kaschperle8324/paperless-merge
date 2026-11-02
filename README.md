@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.3** · [Änderungen](#versionen)
+**Aktuelle Version: 0.4** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -113,6 +113,10 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 
 Mit **Suchen & Vorschläge anzeigen** geht es zur Prüfseite.
 
+**Titel bereinigen** (unten auf der Startseite): entfernt jederzeit nachträglich jedes „(merged)“ aus allen
+Dokumenttiteln in Paperless – auch mehrfache wie „Rechnung 4711 (merged) (merged)“. Vor dem Ausführen
+kommt eine Sicherheitsabfrage.
+
 ### 2. Prüfseite
 Oben steht eine Übersicht: Zeitraum, Anzahl der Rechnungen **mit Vorschlag**, Rechnungen **ohne**
 gefundenen Lieferschein, **freie** Lieferscheine, gewählte Korrespondenten, zusätzliche Tags und ob
@@ -144,8 +148,14 @@ Die Leiste mit **Abbrechen** und **Ausgewählte zusammenführen** bleibt beim Sc
 - Vor dem Ausführen kommt eine **Sicherheitsabfrage** mit der Anzahl der Rechnungen.
 - Ist ein Lieferschein versehentlich **mehreren Rechnungen** zugeordnet, wird **nichts** ausgeführt und ein Hinweis angezeigt.
 - Paperless erstellt die neuen PDFs im Hintergrund – sie erscheinen nach ein bis zwei Minuten.
-- Paperless hängt an den Titel des neuen Dokuments **„(merged)“** an. Auf der Ergebnisseite entfernt der Knopf
-  **Titelzusatz „(merged)“ entfernen** diesen Zusatz bei allen Rechnungen (am besten nach ein, zwei Minuten klicken).
+- **Titelzusatz „(merged)“:** Paperless hängt beim Zusammenführen „(merged)“ an den Titel an. Das wird jetzt
+  automatisch behandelt:
+  - Enthält der Titel der Rechnung schon „(merged)“ (z. B. weil sie früher schon einmal zusammengeführt wurde),
+    wird es **vorher entfernt** – der Zusatz kann sich so nicht stapeln.
+  - Nach dem Zusammenführen entfernt die Erweiterung „(merged)“ **automatisch** aus den neuen Titeln, sobald
+    Paperless die Dokumente angelegt hat (sie prüft dafür bis zu 5 Minuten im Hintergrund).
+  - Zusätzlich gibt es auf der Ergebnisseite den Knopf **„(merged)“ jetzt aus allen Titeln entfernen** und auf der
+    Startseite den Knopf **Titel bereinigen** für die nachträgliche Bereinigung.
 - Ein Vorschlag ist **eine Stunde** gültig und kann nur **einmal** ausgeführt werden – danach neu suchen.
 
 ---
@@ -204,6 +214,7 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `FALLBACK_DAYS` | `45` | Zeitfenster für *unsichere* Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
 | `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung für „Lieferscheine zusätzlich Tage vorher“ |
 | `VERIFY_SSL` | `true` | bei HTTPS mit selbstsigniertem Zertifikat auf `false` setzen |
+| `AUTO_CLEAN_TITLES` | `true` | „(merged)“ nach dem Zusammenführen automatisch aus den Titeln entfernen |
 | `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche (beide setzen) |
 | `TZ` | – | Zeitzone, z. B. `Europe/Berlin` |
 
@@ -224,6 +235,12 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.4 (02.11.2026)
+- „(merged)“ kann sich bei mehreren Durchläufen nicht mehr stapeln: ein vorhandener Zusatz wird vor dem Zusammenführen aus dem Rechnungstitel entfernt
+- „(merged)“ wird nach dem Zusammenführen automatisch aus den neuen Titeln entfernt (abschaltbar mit `AUTO_CLEAN_TITLES`)
+- neuer Knopf **Titel bereinigen** auf der Startseite: entfernt nachträglich jedes „(merged)“ aus allen Dokumenttiteln, auch mehrfache
+- die Bereinigung erfasst jetzt alle Dokumente mit „(merged)“ im Titel, nicht nur Rechnungen mit dem Zusatz am Ende
 
 ### Version 0.3 (02.11.2026)
 Erste versionierte Ausgabe mit folgenden Funktionen:
