@@ -1,12 +1,43 @@
 # paperless-merge
 
-Erweiterung für **Paperless-ngx**: sucht Rechnungen und die passenden Lieferscheine in einem
-wählbaren Zeitraum, zeigt die Zuordnung zur Kontrolle an und fügt sie erst nach Bestätigung zu
-einem PDF zusammen – **Rechnung als erste Seite**, das neue Dokument läuft als Typ **Rechnung**.
+Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
+zu **einem PDF** zusammenführt:
+
+- **Rechnung immer als erste Seite**, danach die Lieferscheine nach Datum
+- das neue Dokument läuft als Dokumententyp **Rechnung** und übernimmt Korrespondent, Tags und Speicherpfad der Rechnung
+- **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
+- frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
+- OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
+
+Die Erweiterung läuft als eigener Docker-Container neben Paperless und arbeitet ausschließlich über
+die Paperless-API. Paperless selbst wird nicht verändert.
+
+---
+
+## Inhalt
+- [Voraussetzungen](#voraussetzungen)
+- [Installation](#installation)
+- [Aktualisieren](#aktualisieren)
+- [Bedienung](#bedienung)
+  - [1. Startseite](#1-startseite)
+  - [2. Prüfseite](#2-prüfseite)
+  - [3. Zusammenführen und Ergebnis](#3-zusammenführen-und-ergebnis)
+- [Was mit den Originalen passiert](#was-mit-den-originalen-passiert)
+- [Wie die Zuordnung funktioniert](#wie-die-zuordnung-funktioniert)
+- [Einstellungen](#einstellungen)
+- [Fehlerbehebung](#fehlerbehebung)
+
+---
+
+## Voraussetzungen
+- Paperless-ngx (Version 2.x) mit den Dokumententypen **Rechnung** und **Lieferschein**
+  (andere Namen über `DOCTYPE_INVOICE` / `DOCTYPE_DELIVERY` einstellbar)
+- ein **API-Token**: in Paperless oben rechts auf das Profil → *API-Auth-Token*
+- der Benutzer, zu dem der Token gehört, braucht Rechte zum **Anzeigen, Ändern, Hinzufügen und Löschen** von Dokumenten
 
 ## Installation
 Das fertige Image liegt unter `ghcr.io/kaschperle8324/paperless-merge:latest` (amd64 + arm64).
-Es wird nur eine `docker-compose.yml` benötigt (auch als Stack in Portainer nutzbar):
+Es wird nur eine `docker-compose.yml` benötigt – in Portainer einfach als neuen Stack einfügen:
 
 ```yaml
 services:
@@ -17,66 +48,157 @@ services:
     ports:
       - "8085:8080"
     environment:
-      PAPERLESS_URL: "http://192.168.1.50:8000"   # Adresse von Paperless
-      PAPERLESS_TOKEN: "HIER_TOKEN_EINTRAGEN"     # Paperless -> Profil -> API-Auth-Token
-      DEFAULT_TAGS: "Posteingang"
+      PAPERLESS_URL: "http://192.168.1.50:8000"   # Adresse von Paperless (IP:Port oder Containername)
+      PAPERLESS_TOKEN: "HIER_TOKEN_EINTRAGEN"     # API-Auth-Token aus Paperless
+      DEFAULT_TAGS: "Posteingang"                 # vorausgewählte Tags für neue Dokumente
       TZ: "Europe/Berlin"
 ```
 
-`PAPERLESS_URL` und `PAPERLESS_TOKEN` anpassen, dann starten:
+`PAPERLESS_URL` und `PAPERLESS_TOKEN` anpassen und starten:
 
 ```bash
 docker compose up -d
 ```
 
-Aufruf im Browser: `http://<server-ip>:8085`
+Aufruf im Browser: **`http://<server-ip>:8085`**
 
-Der Benutzer, zu dem der Token gehört, braucht in Paperless Rechte zum Anzeigen, Ändern,
-Hinzufügen und Löschen von Dokumenten. Weitere Optionen siehe [Einstellungen](#einstellungen-umgebungsvariablen).
+> **Hinweis:** Die Oberfläche hat standardmäßig keinen Login. Entweder nur im Heimnetz betreiben,
+> hinter einen Reverse-Proxy mit Anmeldung hängen oder `APP_USER` / `APP_PASSWORD` setzen.
 
 ## Aktualisieren
 ```bash
 docker compose pull && docker compose up -d
 ```
-In Portainer: **Stacks** → Stack öffnen → **Editor** → **Update the stack** → „Re-pull image and redeploy“ aktivieren.
+**Portainer:** *Stacks* → Stack öffnen → *Editor* → **Update the stack** → „Re-pull image and redeploy“ aktivieren → *Update*.
+Danach die Seite im Browser mit **Strg + F5** neu laden.
+
+---
 
 ## Bedienung
-1. **Zeitraum** (Rechnungsdatum von/bis) eingeben, optional **Korrespondenten** auswählen
-   (nichts gewählt = alle; Lieferscheine ohne Korrespondent können mit durchsucht werden) und **Tags** für die neuen Dokumente wählen
-   (alle vorhandenen Paperless-Tags, „Posteingang“ ist vorausgewählt). „Lieferscheine zusätzlich X Tage vorher“
-   erweitert die Suche nach hinten, weil die Lieferung meist vor der Rechnung liegt.
-2. **Prüfseite**: Jede Rechnung mit Vorschaubild und vorgeschlagenen Lieferscheinen.
-   - grün *sicher*: Lieferscheinnummer in der Rechnung gefunden (oder umgekehrt)
-   - orange *mittel*: Nummer gefunden, aber anderer Korrespondent
-   - rot *unsicher*: nur gleicher Korrespondent + Datum → standardmäßig **abgewählt**
-   - Häkchen setzen/entfernen, weitere Lieferscheine manuell zuordnen, PDFs per Klick ansehen.
-   - Oben stehen die Tags, die die neuen Dokumente zusätzlich bekommen (Standard: Posteingang).
-3. **Zusammenführen** → Sicherheitsabfrage → Paperless erstellt die PDFs im Hintergrund.
+Die Oberfläche nutzt die volle Bildschirmbreite, passt sich an Handy und Tablet an und schaltet
+automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
 
-## Originale
-- Haken „in den Papierkorb verschieben“ (Standard): Originale landen im Paperless-Papierkorb
-  und sind dort wiederherstellbar.
-- Ohne Haken: Originale bleiben, verwendete Lieferscheine bekommen das Tag `LS-zugeordnet`
-  und werden nicht erneut angeboten.
-- Paperless hängt „(merged)“ an den Titel an – auf der Ergebnisseite gibt es einen Knopf zum Entfernen.
+### 1. Startseite
+Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts verändert**.
 
-## Erkennung der Lieferscheinnummer
-Nummern werden hinter Begriffen wie „Lieferschein“, „Lieferschein-Nr.“, „LS-Nr.“, „Lieferung“,
-„Beleg-Nr.“/„Belegnummer“ und „Delivery Note“ gelesen und im jeweils anderen Dokument gesucht.
-Der Vergleich ist OCR-tolerant: typische Verwechslungen wie **LI ↔ 11**, O ↔ 0, S ↔ 5, B ↔ 8 werden
-als gleich gewertet (z. B. `4LI123456` = `411123456`).
+**Zeitraum & Optionen**
+| Feld | Bedeutung |
+|---|---|
+| Rechnungsdatum von / bis | Es werden Rechnungen mit Dokumentdatum in diesem Zeitraum gesucht. Vorbelegt: Anfang des Vormonats bis heute. |
+| Lieferscheine zusätzlich Tage vorher | Lieferscheine liegen meist vor der Rechnung. Hier wird festgelegt, wie viele Tage vor dem Startdatum noch Lieferscheine berücksichtigt werden (Standard 60). |
+| Originale in den Papierkorb verschieben | Siehe [Was mit den Originalen passiert](#was-mit-den-originalen-passiert). Standard: an. |
 
-## Einstellungen (Umgebungsvariablen)
+**Korrespondenten**
+- Alle Korrespondenten aus Paperless werden als anklickbare Felder mit der Anzahl ihrer Dokumente angezeigt.
+- **Nichts ausgewählt = alle Korrespondenten** werden durchsucht.
+- Ab mehr als 12 Einträgen erscheint ein **Suchfeld**; *Auswahl leeren* hebt alle Markierungen auf.
+- **Lieferscheine ohne Korrespondent mit durchsuchen** (Standard: an): Lieferscheine, denen in Paperless
+  kein Korrespondent zugeordnet ist, werden ebenfalls berücksichtigt und über ihre Nummer zugeordnet.
+
+**Tags für die neuen Dokumente**
+- Alle vorhandenen Paperless-Tags erscheinen in ihren Paperless-Farben.
+- Die ausgewählten Tags bekommt das zusammengeführte Dokument **zusätzlich** zu den Tags der Rechnung.
+- Vorausgewählt sind die Tags aus `DEFAULT_TAGS` (Standard: *Posteingang*).
+- Ab mehr als 12 Tags erscheint ein Suchfeld.
+
+Mit **Suchen & Vorschläge anzeigen** geht es zur Prüfseite.
+
+### 2. Prüfseite
+Oben steht eine Übersicht: Zeitraum, Anzahl der Rechnungen **mit Vorschlag**, Rechnungen **ohne**
+gefundenen Lieferschein, **freie** Lieferscheine, gewählte Korrespondenten, zusätzliche Tags und ob
+die Originale gelöscht werden.
+
+Darunter steht jede Rechnung als eigene Karte (auf breiten Bildschirmen mehrere nebeneinander):
+- **Vorschaubild** und Link **PDF ansehen** (bzw. *in Paperless öffnen*, wenn `PAPERLESS_PUBLIC_URL` gesetzt ist)
+- Datum, Korrespondent und ggf. ASN
+- darunter die vorgeschlagenen Lieferscheine mit Bewertung und Begründung:
+
+| Markierung | Bedeutung | Vorauswahl |
+|---|---|---|
+| 🟢 **sicher** | Lieferscheinnummer in der Rechnung gefunden (oder die Rechnung nennt eine Nummer, die im Lieferschein steht) – auch OCR-tolerant | angehakt |
+| 🟠 **mittel** | Nummer gefunden, aber Rechnung und Lieferschein haben **unterschiedliche Korrespondenten** | angehakt – bitte prüfen |
+| 🔴 **unsicher** | keine Nummer gefunden, nur gleicher Korrespondent und passendes Datum | **nicht** angehakt |
+
+**Anpassen**
+- Haken an der **Rechnung** entfernen → diese Rechnung wird nicht bearbeitet.
+- Haken an einem **Lieferschein** entfernen → dieser Lieferschein bleibt außen vor.
+- **Weitere Lieferscheine manuell hinzufügen:** Im Auswahlfeld unter jeder Rechnung stehen alle noch nicht
+  zugeordneten Lieferscheine (Mehrfachauswahl mit Strg / Cmd). Das Anhaken eines Lieferscheins setzt
+  automatisch auch den Haken an der Rechnung.
+- **Rechnungen ohne gefundenen Lieferschein** und **nicht zugeordnete Lieferscheine** stehen eingeklappt
+  am Ende der Seite – auch dort kann manuell zugeordnet werden.
+
+Die Leiste mit **Abbrechen** und **Ausgewählte zusammenführen** bleibt beim Scrollen unten sichtbar.
+
+### 3. Zusammenführen und Ergebnis
+- Vor dem Ausführen kommt eine **Sicherheitsabfrage** mit der Anzahl der Rechnungen.
+- Ist ein Lieferschein versehentlich **mehreren Rechnungen** zugeordnet, wird **nichts** ausgeführt und ein Hinweis angezeigt.
+- Paperless erstellt die neuen PDFs im Hintergrund – sie erscheinen nach ein bis zwei Minuten.
+- Paperless hängt an den Titel des neuen Dokuments **„(merged)“** an. Auf der Ergebnisseite entfernt der Knopf
+  **Titelzusatz „(merged)“ entfernen** diesen Zusatz bei allen Rechnungen (am besten nach ein, zwei Minuten klicken).
+- Ein Vorschlag ist **eine Stunde** gültig und kann nur **einmal** ausgeführt werden – danach neu suchen.
+
+---
+
+## Was mit den Originalen passiert
+| | Originale in den Papierkorb (Standard) | Originale behalten |
+|---|---|---|
+| Rechnung + Lieferscheine | wandern in den **Paperless-Papierkorb** und sind dort wiederherstellbar | bleiben unverändert erhalten |
+| Lieferscheine beim nächsten Lauf | – | bekommen das Tag **`LS-zugeordnet`** und werden nicht mehr vorgeschlagen |
+| Zusatz-Tags (z. B. Posteingang) | nur am neuen Dokument | nur am neuen Dokument – an der Original-Rechnung werden sie wieder entfernt |
+
+Für den ersten Lauf empfiehlt es sich, die Originale zu **behalten** und einen kurzen Zeitraum zu wählen.
+
+## Wie die Zuordnung funktioniert
+1. **Nummern finden:** Im OCR-Text werden Nummern hinter Begriffen wie *Lieferschein*, *Lieferschein-Nr.*,
+   *Lieferscheinnummer*, *LS-Nr.*, *Lieferung*, *Beleg-Nr.*, *Belegnummer* und *Delivery Note* gelesen.
+   Hat ein Lieferschein keine solche Nummer, wird eine lange Ziffernfolge aus dem Titel verwendet.
+2. **In beide Richtungen suchen:** Die Lieferscheinnummer wird in der Rechnung gesucht – und Nummern, die die
+   Rechnung nennt, im Lieferschein. Führende Nullen werden ignoriert.
+3. **OCR-tolerant:** Wird nichts gefunden, folgt ein zweiter Vergleich, der typische Texterkennungsfehler
+   als gleich wertet: **L / I / | → 1**, **O / Q → 0**, **S → 5**, **B → 8**, **Z → 2**.
+   So passt z. B. `4LI123456` zu `411123456`.
+4. **Plausibilität:** Kurze Nummern (unter 5 Ziffern) zählen nur bei gleichem Korrespondenten.
+   Unterschiedliche Korrespondenten stufen einen Treffer auf *mittel* herab.
+5. **Rückfallebene:** Ohne Nummerntreffer wird ein Lieferschein desselben Korrespondenten vorgeschlagen,
+   der bis zu `FALLBACK_DAYS` (Standard 45) Tage vor bis 3 Tage nach der Rechnung datiert ist – immer als *unsicher*.
+6. **Eindeutigkeit:** Jeder Lieferschein wird höchstens **einer** Rechnung zugeordnet – der mit dem besten
+   Treffer bzw. dem nächstliegenden Datum. Dafür werden intern auch Rechnungen kurz vor und nach dem
+   gewählten Zeitraum berücksichtigt, angezeigt werden aber nur Rechnungen aus dem Zeitraum.
+
+---
+
+## Einstellungen
+Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` gesetzt.
+
 | Variable | Standard | Bedeutung |
 |---|---|---|
-| `PAPERLESS_URL` | `http://paperless:8000` | Adresse von Paperless aus Sicht des Containers |
-| `PAPERLESS_TOKEN` | – | API-Token |
-| `PAPERLESS_PUBLIC_URL` | leer | optional: Links öffnen direkt in Paperless statt PDF-Ansicht |
-| `DOCTYPE_INVOICE` | `Rechnung` | Dokumententyp der Rechnungen |
-| `DOCTYPE_DELIVERY` | `Lieferschein` | Dokumententyp der Lieferscheine |
-| `DEFAULT_TAGS` | `Posteingang` | vorausgewählte Tags für neue Dokumente (kommagetrennt) |
-| `DONE_TAG` | `LS-zugeordnet` | Tag für bereits verwendete Lieferscheine |
-| `FALLBACK_DAYS` | `45` | unsichere Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
-| `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung im Formular |
-| `VERIFY_SSL` | `true` | bei selbstsigniertem Zertifikat auf `false` |
-| `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche |
+| `PAPERLESS_URL` | `http://paperless:8000` | Adresse von Paperless aus Sicht des Containers (IP:Port oder Containername im selben Docker-Netz) |
+| `PAPERLESS_TOKEN` | – | API-Auth-Token |
+| `PAPERLESS_PUBLIC_URL` | leer | optional: Adresse, unter der Paperless im Browser erreichbar ist. Dann öffnen die Links direkt in Paperless statt in der PDF-Ansicht |
+| `DOCTYPE_INVOICE` | `Rechnung` | Name des Dokumententyps für Rechnungen |
+| `DOCTYPE_DELIVERY` | `Lieferschein` | Name des Dokumententyps für Lieferscheine |
+| `DEFAULT_TAGS` | `Posteingang` | vorausgewählte Tags für neue Dokumente, mehrere durch Komma getrennt |
+| `DONE_TAG` | `LS-zugeordnet` | Tag für bereits verwendete Lieferscheine (wird bei Bedarf automatisch angelegt) |
+| `FALLBACK_DAYS` | `45` | Zeitfenster für *unsichere* Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
+| `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung für „Lieferscheine zusätzlich Tage vorher“ |
+| `VERIFY_SSL` | `true` | bei HTTPS mit selbstsigniertem Zertifikat auf `false` setzen |
+| `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche (beide setzen) |
+| `TZ` | – | Zeitzone, z. B. `Europe/Berlin` |
+
+---
+
+## Fehlerbehebung
+| Meldung / Problem | Ursache und Lösung |
+|---|---|
+| *Dokumententyp „Rechnung“ oder „Lieferschein“ nicht gefunden* | Die Namen müssen exakt wie in Paperless lauten – sonst `DOCTYPE_INVOICE` / `DOCTYPE_DELIVERY` anpassen. |
+| *Fehler bei der Abfrage von Paperless* (Verbindungsfehler) | `PAPERLESS_URL` prüfen. Am einfachsten die IP mit Port eintragen, z. B. `http://192.168.1.50:8000`. |
+| *HTTP 401* oder *403* | Token falsch oder dem Benutzer fehlen Rechte. |
+| *Tags/Korrespondenten konnten nicht geladen werden* | wie oben – Verbindung oder Token prüfen. |
+| Neue Dokumente erscheinen nicht | Paperless verarbeitet im Hintergrund – kurz warten. Bei Problemen in Paperless unter *Dateiaufgaben* nachsehen. |
+| Lieferscheine werden nicht gefunden | Prüfen, ob die Nummer im OCR-Text (Paperless → Dokument → *Inhalt*) hinter einem der oben genannten Begriffe steht. Bessere Erkennung: mit 300 dpi scannen, `PAPERLESS_OCR_LANGUAGE: deu` setzen, Dokument in Paperless *erneut verarbeiten*. |
+| Vorschlag „abgelaufen“ | Vorschläge gelten eine Stunde und nur für einen Lauf – einfach neu suchen. |
+| Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
+
+## Lizenz
+Siehe [LICENSE](LICENSE).
