@@ -4,21 +4,41 @@ Erweiterung für **Paperless-ngx**: sucht Rechnungen und die passenden Liefersch
 wählbaren Zeitraum, zeigt die Zuordnung zur Kontrolle an und fügt sie erst nach Bestätigung zu
 einem PDF zusammen – **Rechnung als erste Seite**, das neue Dokument läuft als Typ **Rechnung**.
 
+## Installation
+Das fertige Image liegt unter `ghcr.io/kaschperle8324/paperless-merge:latest` (amd64 + arm64).
+Es wird nur eine `docker-compose.yml` benötigt (auch als Stack in Portainer nutzbar):
 
-## Auf dem Docker-Host
-Nur die `docker-compose.yml` anlegen, `DEIN-GITHUB-NAME`, `PAPERLESS_URL` und
-`PAPERLESS_TOKEN` eintragen, dann:
+```yaml
+services:
+  paperless-merge:
+    image: ghcr.io/kaschperle8324/paperless-merge:latest
+    container_name: paperless-merge
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    environment:
+      PAPERLESS_URL: "http://192.168.1.50:8000"   # Adresse von Paperless
+      PAPERLESS_TOKEN: "HIER_TOKEN_EINTRAGEN"     # Paperless -> Profil -> API-Auth-Token
+      DEFAULT_TAGS: "Posteingang"
+      TZ: "Europe/Berlin"
+```
+
+`PAPERLESS_URL` und `PAPERLESS_TOKEN` anpassen, dann starten:
 
 ```bash
 docker compose up -d
 ```
 
-Aufruf: `http://<server-ip>:8085`
+Aufruf im Browser: `http://<server-ip>:8085`
 
-**Update:** Änderung auf GitHub pushen → Action baut neu → auf dem Server
-`docker compose pull && docker compose up -d`.
+Der Benutzer, zu dem der Token gehört, braucht in Paperless Rechte zum Anzeigen, Ändern,
+Hinzufügen und Löschen von Dokumenten. Weitere Optionen siehe [Einstellungen](#einstellungen-umgebungsvariablen).
 
-Der Token-Benutzer braucht in Paperless Rechte zum Anzeigen, Ändern, Hinzufügen und Löschen von Dokumenten.
+## Aktualisieren
+```bash
+docker compose pull && docker compose up -d
+```
+In Portainer: **Stacks** → Stack öffnen → **Editor** → **Update the stack** → „Re-pull image and redeploy“ aktivieren.
 
 ## Bedienung
 1. **Zeitraum** (Rechnungsdatum von/bis) eingeben, optional **Korrespondenten** auswählen
