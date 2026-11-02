@@ -1,0 +1,36 @@
+# Diese Datei auf dem Docker-Host anlegen – mehr ist nicht nötig.
+# DEIN-GITHUB-NAME durch deinen GitHub-Benutzernamen ersetzen (kleingeschrieben).
+services:
+  paperless-merge:
+    image: ghcr.io/DEIN-GITHUB-NAME/paperless-merge:latest
+    container_name: paperless-merge
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    environment:
+      # Adresse von Paperless – so, wie dein Server sie erreicht:
+      #   gleiche Docker-Netz:  http://paperless-webserver-1:8000  (Containername, siehe "docker ps")
+      #   sonst einfach IP:     http://192.168.1.50:8000
+      PAPERLESS_URL: "http://192.168.1.50:8000"
+      # API-Token: Paperless -> Profil (oben rechts) -> API-Auth-Token
+      PAPERLESS_TOKEN: "HIER_TOKEN_EINTRAGEN"
+      # optional – nur wenn die Links direkt in Paperless öffnen sollen
+      # (sonst zeigt das Tool die PDFs selbst an)
+      # PAPERLESS_PUBLIC_URL: "http://192.168.1.50:8000"
+      DOCTYPE_INVOICE: "Rechnung"
+      DOCTYPE_DELIVERY: "Lieferschein"
+      DONE_TAG: "LS-zugeordnet"
+      FALLBACK_DAYS: "45"
+      DEFAULT_LOOKBACK_DAYS: "60"
+      TZ: "Europe/Berlin"
+      # optionaler Login für die Oberfläche
+      # APP_USER: "markus"
+      # APP_PASSWORD: "geheim"
+
+# Nur wenn du Paperless per Containername ansprechen willst:
+# Netzwerk von Paperless hier eintragen (docker network ls) und oben beim Service
+# "networks: [paperless]" ergänzen.
+# networks:
+#   paperless:
+#     external: true
+#     name: paperless_default
