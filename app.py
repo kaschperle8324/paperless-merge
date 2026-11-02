@@ -28,6 +28,7 @@ TOKEN = os.environ.get("PAPERLESS_TOKEN", "")
 TYPE_INVOICE = os.environ.get("DOCTYPE_INVOICE", "Rechnung")
 TYPE_DELIVERY = os.environ.get("DOCTYPE_DELIVERY", "Lieferschein")
 DONE_TAG = os.environ.get("DONE_TAG", "LS-zugeordnet")
+DEFAULT_TAGS = [t.strip().lower() for t in os.environ.get("DEFAULT_TAGS", "Posteingang").split(",") if t.strip()]
 FALLBACK_DAYS = int(os.environ.get("FALLBACK_DAYS", "45"))
 DEFAULT_LOOKBACK = int(os.environ.get("DEFAULT_LOOKBACK_DAYS", "60"))
 VERIFY_SSL = os.environ.get("VERIFY_SSL", "true").lower() not in ("0", "false", "no")
@@ -36,6 +37,7 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD")
 PLAN_TTL = 3600  # Sekunden, wie lange ein Vorschlag gültig bleibt
 
 app = Flask(__name__)
+app.jinja_env.filters["de"] = lambda d: f"{d[8:10]}.{d[5:7]}.{d[0:4]}" if d and len(d) >= 10 else d
 PLANS = {}
 PLANS_LOCK = threading.Lock()
 
@@ -98,6 +100,15 @@ class Paperless:
             "documents": doc_ids,
             "method": "merge",
             "parameters": {"metadata_document_id": metadata_id, "delete_originals": delete_originals},
+        })
+
+    def tags(self):
+        return sorted(self.all("/api/tags/"), key=lambda t: t["name"].lower())
+
+    def modify_tags(self, doc_ids, add=(), remove=()):
+        return self.send("POST", "/api/documents/bulk_edit/", {
+            "documents": doc_ids, "method": "modify_tags",
+            "parameters": {"add_tags": list(add), "remove_tags": list(remove)},
         })
 
     def add_tag(self, doc_ids, tag_id):
@@ -166,6 +177,7 @@ def summarize(doc, corr):
         "date": _date(doc).isoformat(),
         "correspondent": corr.get(doc.get("correspondent"), "–"),
         "asn": doc.get("archive_serial_number"),
+        "tags": doc.get("tags") or [],
     }
 
 
@@ -259,26 +271,75 @@ def require_auth(f):
 
 BASE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Rechnung + Lieferschein</title><style>
-body{font-family:system-ui,sans-serif;margin:0;background:#f4f5f7;color:#222}
-header{background:#17541f;color:#fff;padding:14px 20px;font-size:1.2em}
-main{max-width:1100px;margin:20px auto;padding:0 16px}
-.card{background:#fff;border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px #0002}
-label{display:block;margin:8px 0 4px;font-weight:600}
-input[type=date],input[type=number]{padding:6px;font-size:1em}
-button{background:#17541f;color:#fff;border:0;padding:10px 18px;border-radius:6px;font-size:1em;cursor:pointer}
-button.sec{background:#666}
-.grp-head{display:flex;gap:12px;align-items:center;border-bottom:1px solid #ddd;padding-bottom:10px}
-.row{display:flex;gap:12px;align-items:center;padding:8px 0 8px 28px;border-bottom:1px dashed #eee}
-img.th{width:70px;height:95px;object-fit:cover;border:1px solid #ccc;background:#eee}
-.meta{color:#666;font-size:.9em}
-.badge{padding:2px 8px;border-radius:10px;font-size:.8em;color:#fff}
-.sicher{background:#2e7d32}.mittel{background:#ef6c00}.unsicher{background:#c62828}
-.tag{background:#17541f;color:#fff;padding:1px 6px;border-radius:4px;font-size:.8em}
-select{min-width:320px;margin-left:28px}
-.err{background:#fdecea;color:#b71c1c}.ok{background:#e8f5e9}
-a{color:#17541f}
-</style></head><body><header>Paperless · Rechnung + Lieferschein zusammenführen</header><main>
+:root{
+  --bg:#f5f6fa;--surface:#fff;--surface2:#f0f2f8;--text:#111827;--muted:#6b7280;--line:#e5e7eb;
+  --accent:#6366f1;--accent2:#8b5cf6;--accent-soft:#eef2ff;--ring:#6366f155;
+  --ok-bg:#dcfce7;--ok:#15803d;--warn-bg:#ffedd5;--warn:#c2410c;--bad-bg:#fee2e2;--bad:#b91c1c;
+  --shadow:0 1px 2px #0000000d,0 4px 16px #0000000a;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0b0f1a;--surface:#141a29;--surface2:#1b2234;--text:#e5e7eb;--muted:#94a3b8;--line:#263045;
+  --accent:#818cf8;--accent2:#a78bfa;--accent-soft:#1e2340;--ring:#818cf855;
+  --ok-bg:#052e1a;--ok:#4ade80;--warn-bg:#3b1d06;--warn:#fb923c;--bad-bg:#3a0d0d;--bad:#f87171;
+  --shadow:0 1px 2px #0006,0 6px 20px #0004;
+}}
+*{box-sizing:border-box}
+body{font-family:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;background:var(--bg);color:var(--text);line-height:1.5}
+header{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--surface) 85%,transparent);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--line);padding:14px 24px;display:flex;align-items:center;gap:12px}
+.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+  display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
+header h1{font-size:1.05rem;margin:0;font-weight:650}
+header small{color:var(--muted);display:block;font-size:.8rem;font-weight:400}
+main{max-width:1080px;margin:24px auto 40px;padding:0 16px}
+h3{margin:0 0 12px;font-size:1.05rem;font-weight:650}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+label.f{display:block;margin:0 0 6px;font-size:.85rem;font-weight:600;color:var(--muted)}
+input[type=date],input[type=number],input[type=search],select{width:100%;padding:10px 12px;font:inherit;color:var(--text);
+  background:var(--surface2);border:1px solid var(--line);border-radius:10px;outline:none}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+.switch{display:flex;gap:10px;align-items:center;margin-top:14px;cursor:pointer;font-weight:500}
+.switch input{width:18px;height:18px;accent-color:var(--accent)}
+button,.btn{display:inline-flex;align-items:center;gap:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:0;
+  padding:11px 20px;border-radius:12px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none;box-shadow:0 4px 14px var(--ring)}
+button:hover,.btn:hover{filter:brightness(1.08)}
+button.sec,.btn.sec{background:var(--surface2);color:var(--text);box-shadow:none;border:1px solid var(--line)}
+.meta{color:var(--muted);font-size:.88rem}
+.grp-head{display:flex;gap:14px;align-items:center}
+.items{margin-top:12px;border-top:1px solid var(--line)}
+.row{display:flex;gap:14px;align-items:center;padding:12px 0 12px 32px;border-bottom:1px solid var(--line)}
+.row:last-child{border-bottom:0}
+input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);flex:none}
+img.th{width:64px;height:86px;object-fit:cover;border-radius:8px;border:1px solid var(--line);background:var(--surface2);flex:none;transition:transform .15s}
+img.th:hover{transform:scale(1.05)}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.75rem;font-weight:600;letter-spacing:.02em}
+.sicher{background:var(--ok-bg);color:var(--ok)}.mittel{background:var(--warn-bg);color:var(--warn)}.unsicher{background:var(--bad-bg);color:var(--bad)}
+.tag{display:inline-block;background:var(--accent-soft);color:var(--accent);padding:2px 10px;border-radius:999px;font-size:.75rem;font-weight:600}
+.add{margin:10px 0 0 32px;width:calc(100% - 32px)}
+.err{border-color:var(--bad);background:var(--bad-bg);color:var(--bad)}
+.ok{border-color:var(--ok);background:var(--ok-bg);color:var(--ok)}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;max-height:220px;overflow:auto;padding:2px}
+.chip input{display:none}
+.chip span{display:inline-block;padding:6px 14px;border-radius:999px;border:1px solid var(--line);background:var(--surface2);
+  cursor:pointer;font-size:.88rem;font-weight:500;transition:all .12s}
+.chip span::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--c);margin-right:8px;vertical-align:1px}
+.chip input:checked+span{background:var(--c);color:var(--tc);border-color:var(--c);box-shadow:0 2px 8px #0002}
+.chip input:checked+span::before{background:var(--tc)}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.78rem;font-weight:600;margin-right:4px}
+.stats{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+.stat{background:var(--surface2);border:1px solid var(--line);border-radius:12px;padding:8px 14px}
+.stat b{font-size:1.2rem;display:block}
+details.card summary{cursor:pointer;font-weight:600}
+.bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
+  background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
+a{color:var(--accent)}
+ul{padding-left:18px}
+</style></head><body>
+<header><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></header>
+<main>
 {% block body %}{% endblock %}</main></body></html>"""
 
 
@@ -289,27 +350,50 @@ def page(body, **ctx):
 INDEX = """
 {% if error %}<div class="card err">{{ error }}</div>{% endif %}
 <form class="card" method="post" action="{{ url_for('preview') }}">
-  <h3>1. Zeitraum festlegen</h3>
-  <label>Rechnungsdatum von</label><input type="date" name="start" value="{{ start }}" required>
-  <label>Rechnungsdatum bis</label><input type="date" name="end" value="{{ end }}" required>
-  <label>Lieferscheine zusätzlich so viele Tage vor dem Startdatum berücksichtigen</label>
-  <input type="number" name="lookback" value="{{ lookback }}" min="0" max="365">
-  <label><input type="checkbox" name="delete_originals" value="1" checked>
+  <h3>1 · Zeitraum &amp; Optionen</h3>
+  <div class="grid2">
+    <div><label class="f">Rechnungsdatum von</label><input type="date" name="start" value="{{ start }}" required></div>
+    <div><label class="f">Rechnungsdatum bis</label><input type="date" name="end" value="{{ end }}" required></div>
+    <div><label class="f">Lieferscheine zusätzlich Tage vorher</label>
+      <input type="number" name="lookback" value="{{ lookback }}" min="0" max="365"></div>
+  </div>
+  <label class="switch"><input type="checkbox" name="delete_originals" value="1" checked>
     Originale nach dem Zusammenführen in den Papierkorb verschieben</label>
-  <p class="meta">Ohne Haken bleiben die Originale erhalten; die verwendeten Lieferscheine
-    bekommen dann das Tag „{{ done_tag }}“ und werden beim nächsten Lauf nicht mehr vorgeschlagen.</p>
-  <button>Suchen &amp; Vorschläge anzeigen</button>
+  <p class="meta">Ohne Haken bleiben die Originale erhalten; verwendete Lieferscheine bekommen das Tag
+    „{{ done_tag }}“ und werden beim nächsten Lauf nicht mehr vorgeschlagen.</p>
+
+  <h3 style="margin-top:22px">Tags für die neuen Dokumente</h3>
+  <p class="meta" style="margin:0">Zusätzlich zu den Tags der Rechnung. Anklicken zum An-/Abwählen.</p>
+  {% if tags %}
+  {% if tags|length > 12 %}<input type="search" id="tagfilter" placeholder="Tag suchen …" style="margin-top:10px">{% endif %}
+  <div class="chips" id="chips">
+    {% for t in tags %}<label class="chip" data-name="{{ t.name|lower }}"><input type="checkbox" name="tags" value="{{ t.id }}"
+      {{ 'checked' if t.preselect }}><span style="--c:{{ t.color or '#6366f1' }};--tc:{{ t.text_color or '#ffffff' }}">{{ t.name }}</span></label>{% endfor %}
+  </div>
+  {% else %}<p class="meta">Keine Tags geladen.</p>{% endif %}
+
+  <div style="margin-top:22px"><button>Suchen &amp; Vorschläge anzeigen →</button></div>
 </form>
 <div class="card meta">Es wird noch nichts verändert – im nächsten Schritt prüfst du alle Zuordnungen.</div>
+<script>
+const f=document.getElementById('tagfilter');
+if(f)f.addEventListener('input',()=>{const q=f.value.toLowerCase();
+  document.querySelectorAll('#chips .chip').forEach(c=>c.style.display=c.dataset.name.includes(q)||c.querySelector('input').checked?'':'none')});
+</script>
 """
 
 PREVIEW = """
 <form method="post" action="{{ url_for('execute') }}" id="f">
 <input type="hidden" name="plan" value="{{ plan_id }}">
-<div class="card"><h3>2. Zuordnungen prüfen</h3>
-  Zeitraum {{ start }} bis {{ end }} · {{ plan.groups|length }} Rechnungen mit Lieferschein-Vorschlag,
-  {{ plan.without|length }} ohne, {{ plan.unassigned|length }} Lieferscheine nicht zugeordnet.<br>
-  Originale: <b>{{ "werden in den Papierkorb verschoben" if delete_originals else "bleiben erhalten" }}</b>
+<div class="card"><h3>2 · Zuordnungen prüfen</h3>
+  <div class="meta">Zeitraum {{ start.strftime('%d.%m.%Y') }} – {{ end.strftime('%d.%m.%Y') }}</div>
+  <div class="stats">
+    <div class="stat"><b>{{ plan.groups|length }}</b><span class="meta">mit Vorschlag</span></div>
+    <div class="stat"><b>{{ plan.without|length }}</b><span class="meta">Rechnungen ohne</span></div>
+    <div class="stat"><b>{{ plan.unassigned|length }}</b><span class="meta">Lieferscheine frei</span></div>
+  </div>
+  Originale: <b>{{ "werden in den Papierkorb verschoben" if delete_originals else "bleiben erhalten" }}</b><br>
+  Zusätzliche Tags: {% for t in extra_tags %}<span class="pill" style="background:{{ t.color or '#6366f1' }};color:{{ t.text_color or '#fff' }}">{{ t.name }}</span>{% else %}<span class="meta">keine</span>{% endfor %}
   <p class="meta">Reihenfolge im neuen PDF: Rechnung zuerst, danach die Lieferscheine nach Datum.
   Das neue Dokument übernimmt Titel, Korrespondent, Tags und Dokumententyp „{{ type_invoice }}“ der Rechnung.
   <span class="badge sicher">sicher</span> Nummer gefunden ·
@@ -323,21 +407,23 @@ PREVIEW = """
     <input type="checkbox" name="inv" value="{{ g.inv.id }}" class="inv" {{ 'checked' if g.checked }}>
     <a href="{{ link(g.inv.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=g.inv.id) }}"></a>
     <div><span class="tag">{{ type_invoice }}</span> <b>{{ g.inv.title }}</b><br>
-      <span class="meta">{{ g.inv.date }} · {{ g.inv.correspondent }}{% if g.inv.asn %} · ASN {{ g.inv.asn }}{% endif %} ·
+      <span class="meta">{{ g.inv.date|de }} · {{ g.inv.correspondent }}{% if g.inv.asn %} · ASN {{ g.inv.asn }}{% endif %} ·
       <a href="{{ link(g.inv.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span></div>
   </div>
+  {% if g['items'] %}<div class="items">{% endif %}
   {% for i in g['items'] %}
   <div class="row">
     <input type="checkbox" name="ls_{{ g.inv.id }}" value="{{ i.id }}" class="ls" data-inv="{{ g.inv.id }}" {{ 'checked' if i.checked }}>
     <a href="{{ link(i.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=i.id) }}"></a>
     <div><span class="badge {{ i.level }}">{{ i.level }}</span> <b>{{ i.title }}</b><br>
-      <span class="meta">{{ i.date }} · {{ i.correspondent }} · {{ i.reason }}</span></div>
+      <span class="meta">{{ i.date|de }} · {{ i.correspondent }} · {{ i.reason }}</span></div>
   </div>
   {% endfor %}
+  {% if g['items'] %}</div>{% endif %}
   {% if plan.unassigned %}
-  <p class="meta" style="margin-left:28px">Weitere Lieferscheine manuell hinzufügen (Strg/Cmd für Mehrfachauswahl):</p>
+  <p class="meta" style="margin:12px 0 0 32px">Weitere Lieferscheine manuell hinzufügen (Strg/Cmd für Mehrfachauswahl):</p>
   <select name="add_{{ g.inv.id }}" multiple size="3" class="add" data-inv="{{ g.inv.id }}">
-    {% for u in plan.unassigned %}<option value="{{ u.id }}">{{ u.date }} · {{ u.correspondent }} · {{ u.title }}</option>{% endfor %}
+    {% for u in plan.unassigned %}<option value="{{ u.id }}">{{ u.date|de }} · {{ u.correspondent }} · {{ u.title }}</option>{% endfor %}
   </select>
   {% endif %}
 </div>
@@ -351,11 +437,11 @@ PREVIEW = """
 {% if plan.unassigned %}
 <details class="card"><summary><b>{{ plan.unassigned|length }} nicht zugeordnete Lieferscheine</b></summary>
 <ul>{% for u in plan.unassigned %}<li><a href="{{ link(u.id) }}" target="_blank">{{ u.title }}</a>
-  <span class="meta">{{ u.date }} · {{ u.correspondent }}</span></li>{% endfor %}</ul></details>
+  <span class="meta">{{ u.date|de }} · {{ u.correspondent }}</span></li>{% endfor %}</ul></details>
 {% endif %}
 
-<div class="card"><button type="submit">3. Ausgewählte jetzt zusammenführen</button>
-  <a href="{{ url_for('index') }}"><button type="button" class="sec">Abbrechen</button></a></div>
+<div class="card bar"><a class="btn sec" href="{{ url_for('index') }}">← Abbrechen</a>
+  <button type="submit">3 · Ausgewählte zusammenführen</button></div>
 </form>
 <script>
 document.querySelectorAll('.ls,.add').forEach(el => el.addEventListener('change', () => {
@@ -377,7 +463,7 @@ document.getElementById('f').addEventListener('submit', e => {
 """
 
 RESULT = """
-<div class="card {{ 'err' if errors else 'ok' }}"><h3>Ergebnis</h3>
+<div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Ergebnis</h3>
   {{ done|length }} Zusammenführung(en) an Paperless übergeben{% if errors %}, {{ errors|length }} Fehler{% endif %}.
   <p class="meta">Paperless verarbeitet die neuen PDFs im Hintergrund – sie erscheinen nach kurzer Zeit.</p></div>
 {% for d in done %}<div class="card">✔ {{ d.title }} + {{ d.count }} Lieferschein(e)</div>{% endfor %}
@@ -386,7 +472,7 @@ RESULT = """
   <form method="post" action="{{ url_for('cleanup_titles') }}" style="display:inline">
     <button class="sec">Titelzusatz „(merged)“ entfernen</button></form>
   <span class="meta">(nach ein, zwei Minuten, wenn Paperless fertig ist)</span>
-  <p><a href="{{ url_for('index') }}">Neuer Durchlauf</a></p></div>
+  <p style="margin-top:14px"><a class="btn" href="{{ url_for('index') }}">Neuer Durchlauf</a></p></div>
 """
 
 
@@ -409,8 +495,17 @@ def _cleanup_plans():
 def index(error=None):
     today = dt.date.today()
     first_prev = (today.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
+    tags = []
+    try:
+        for t in Paperless().tags():
+            if t["name"] == DONE_TAG:
+                continue
+            t["preselect"] = t["name"].lower() in DEFAULT_TAGS
+            tags.append(t)
+    except Exception as e:  # noqa: BLE001
+        error = error or f"Tags konnten nicht geladen werden: {e}"
     return page(INDEX, error=error, start=first_prev.isoformat(), end=today.isoformat(),
-                lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG)
+                lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, tags=tags)
 
 
 @app.route("/preview", methods=["POST"])
@@ -438,6 +533,8 @@ def preview():
         invoices = pl.documents(t_inv, start - dt.timedelta(days=lookback), end + dt.timedelta(days=FALLBACK_DAYS))
         deliveries = pl.documents(t_ls, start - dt.timedelta(days=lookback), end, exclude_tag=done_tag)
         corr = pl.correspondents()
+        wanted = {int(x) for x in request.form.getlist("tags") if x.isdigit()}
+        extra_tags = [t for t in pl.tags() if t["id"] in wanted] if wanted else []
     except Exception as e:  # noqa: BLE001
         return index(error=f"Fehler bei der Abfrage von Paperless: {e}")
 
@@ -447,9 +544,11 @@ def preview():
 
     plan_id = uuid.uuid4().hex
     with PLANS_LOCK:
-        PLANS[plan_id] = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals}
+        PLANS[plan_id] = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals,
+                          "extra_tags": [t["id"] for t in extra_tags]}
     return page(PREVIEW, plan=plan, plan_id=plan_id, start=start, end=end,
-                delete_originals=delete_originals, public=PAPERLESS_PUBLIC_URL, link=doc_link, type_invoice=TYPE_INVOICE)
+                delete_originals=delete_originals, public=PAPERLESS_PUBLIC_URL, link=doc_link,
+                type_invoice=TYPE_INVOICE, extra_tags=extra_tags)
 
 
 @app.route("/execute", methods=["POST"])
@@ -485,13 +584,29 @@ def execute():
 
     pl = Paperless()
     done, errors, tag_ls = [], [], []
+    extra = stored.get("extra_tags", [])
     for inv, ls_ids in jobs:
+        # Das neue Dokument übernimmt die Tags der Rechnung -> zusätzliche Tags vorher an die Rechnung
+        add_now = [t for t in extra if t not in inv.get("tags", [])]
         try:
+            if add_now:
+                pl.modify_tags([inv["id"]], add=add_now)
             pl.merge([inv["id"]] + ls_ids, inv["id"], stored["delete_originals"])
             done.append({"title": inv["title"], "count": len(ls_ids)})
             tag_ls.extend(ls_ids)
         except Exception as e:  # noqa: BLE001
             errors.append(f"{inv['title']}: {e}")
+            if add_now:  # nichts zusammengeführt -> Rechnung wieder wie vorher
+                try:
+                    pl.modify_tags([inv["id"]], remove=add_now)
+                except Exception:  # noqa: BLE001
+                    pass
+            continue
+        if add_now and not stored["delete_originals"]:
+            try:  # Original-Rechnung bleibt erhalten -> dort die Zusatz-Tags wieder entfernen
+                pl.modify_tags([inv["id"]], remove=add_now)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{inv['title']}: Zusatz-Tags am Original nicht entfernt: {e}")
 
     if tag_ls and not stored["delete_originals"]:
         try:

@@ -30,13 +30,15 @@ Aufruf: `http://<server-ip>:8085`
 Der Token-Benutzer braucht in Paperless Rechte zum Anzeigen, Ändern, Hinzufügen und Löschen von Dokumenten.
 
 ## Bedienung
-1. **Zeitraum** (Rechnungsdatum von/bis) eingeben. „Lieferscheine zusätzlich X Tage vorher“
+1. **Zeitraum** (Rechnungsdatum von/bis) eingeben und **Tags** für die neuen Dokumente wählen
+   (alle vorhandenen Paperless-Tags, „Posteingang“ ist vorausgewählt). „Lieferscheine zusätzlich X Tage vorher“
    erweitert die Suche nach hinten, weil die Lieferung meist vor der Rechnung liegt.
 2. **Prüfseite**: Jede Rechnung mit Vorschaubild und vorgeschlagenen Lieferscheinen.
    - grün *sicher*: Lieferscheinnummer in der Rechnung gefunden (oder umgekehrt)
    - orange *mittel*: Nummer gefunden, aber anderer Korrespondent
    - rot *unsicher*: nur gleicher Korrespondent + Datum → standardmäßig **abgewählt**
    - Häkchen setzen/entfernen, weitere Lieferscheine manuell zuordnen, PDFs per Klick ansehen.
+   - Oben stehen die Tags, die die neuen Dokumente zusätzlich bekommen (Standard: Posteingang).
 3. **Zusammenführen** → Sicherheitsabfrage → Paperless erstellt die PDFs im Hintergrund.
 
 ## Originale
@@ -54,6 +56,7 @@ Der Token-Benutzer braucht in Paperless Rechte zum Anzeigen, Ändern, Hinzufüge
 | `PAPERLESS_PUBLIC_URL` | leer | optional: Links öffnen direkt in Paperless statt PDF-Ansicht |
 | `DOCTYPE_INVOICE` | `Rechnung` | Dokumententyp der Rechnungen |
 | `DOCTYPE_DELIVERY` | `Lieferschein` | Dokumententyp der Lieferscheine |
+| `DEFAULT_TAGS` | `Posteingang` | vorausgewählte Tags für neue Dokumente (kommagetrennt) |
 | `DONE_TAG` | `LS-zugeordnet` | Tag für bereits verwendete Lieferscheine |
 | `FALLBACK_DAYS` | `45` | unsichere Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
 | `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung im Formular |

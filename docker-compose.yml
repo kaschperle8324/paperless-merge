@@ -1,8 +1,7 @@
 # Diese Datei auf dem Docker-Host anlegen – mehr ist nicht nötig.
-# DEIN-GITHUB-NAME durch deinen GitHub-Benutzernamen ersetzen (kleingeschrieben).
 services:
   paperless-merge:
-    image: ghcr.io/DEIN-GITHUB-NAME/paperless-merge:latest
+    image: ghcr.io/kaschperle8324/paperless-merge:latest
     container_name: paperless-merge
     restart: unless-stopped
     ports:
@@ -20,6 +19,8 @@ services:
       DOCTYPE_INVOICE: "Rechnung"
       DOCTYPE_DELIVERY: "Lieferschein"
       DONE_TAG: "LS-zugeordnet"
+      # vorausgewählte Tags für die neuen Dokumente (kommagetrennt, im Formular änderbar)
+      DEFAULT_TAGS: "Posteingang"
       FALLBACK_DAYS: "45"
       DEFAULT_LOOKBACK_DAYS: "60"
       TZ: "Europe/Berlin"
