@@ -24,6 +24,8 @@ from flask import Flask, Response, abort, redirect, render_template_string, requ
 # --------------------------------------------------------------------------- Konfiguration
 PAPERLESS_URL = os.environ.get("PAPERLESS_URL", "http://paperless:8000").rstrip("/")
 PAPERLESS_PUBLIC_URL = os.environ.get("PAPERLESS_PUBLIC_URL", "").rstrip("/")  # optional
+# Ziel der Taste "Paperless öffnen": PUBLIC_URL, sonst PAPERLESS_URL (passt, wenn dort IP:Port steht)
+PAPERLESS_BROWSER_URL = PAPERLESS_PUBLIC_URL or PAPERLESS_URL
 TOKEN = os.environ.get("PAPERLESS_TOKEN", "")
 TYPE_INVOICE = os.environ.get("DOCTYPE_INVOICE", "Rechnung")
 TYPE_DELIVERY = os.environ.get("DOCTYPE_DELIVERY", "Lieferschein")
@@ -563,16 +565,26 @@ a{color:var(--accent)}
 .num.hit::before{content:"✓ "}
 .none{color:var(--muted);font-style:italic;font-size:.8rem}
 li .num{margin-left:6px}
-.ver{margin-left:auto;padding:4px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.8rem;font-weight:600}
+header{flex-wrap:wrap}
+.home{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none}
+.hnav{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hbtn{padding:7px 14px;border-radius:10px;border:1px solid var(--line);background:var(--surface2);color:var(--text);
+  text-decoration:none;font-size:.88rem;font-weight:600}
+.hbtn:hover{border-color:var(--accent);color:var(--accent)}
+.ver{padding:4px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.8rem;font-weight:600}
 ul{padding-left:18px}
 </style></head><body>
-<header><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div><span class="ver">v{{ version }}</span></header>
+<header><a href="{{ url_for('index') }}" class="home"><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></a>
+<nav class="hnav"><a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
+{% if paperless_link %}<a class="hbtn" href="{{ paperless_link }}" target="_blank" rel="noopener">Paperless öffnen ↗</a>{% endif %}
+<span class="ver">v{{ version }}</span></nav></header>
 <main>
 {% block body %}{% endblock %}</main></body></html>"""
 
 
 def page(body, **ctx):
     ctx.setdefault("version", VERSION)
+    ctx.setdefault("paperless_link", PAPERLESS_BROWSER_URL)
     return render_template_string(BASE.replace("{% block body %}{% endblock %}", body), **ctx)
 
 

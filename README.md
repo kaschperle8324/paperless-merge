@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.7** · [Änderungen](#versionen)
+**Aktuelle Version: 0.8** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -89,6 +89,13 @@ Versionsnummer oben rechts in der Oberfläche.
 ## Bedienung
 Die Oberfläche nutzt die volle Bildschirmbreite, passt sich an Handy und Tablet an und schaltet
 automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
+
+**Kopfzeile** (auf jeder Seite)
+- **⌂ Start** – zurück zur Startseite; ein Klick auf das Logo bzw. den Titel geht ebenfalls dorthin.
+- **Paperless öffnen ↗** – öffnet die Paperless-Instanz in einem neuen Tab. Verwendet wird `PAPERLESS_PUBLIC_URL`,
+  wenn gesetzt, sonst `PAPERLESS_URL`. Steht in `PAPERLESS_URL` ein Containername (z. B. `http://paperless:8000`),
+  den der Browser nicht kennt, `PAPERLESS_PUBLIC_URL` mit der Adresse setzen, unter der Paperless im Browser aufgerufen wird.
+- rechts die laufende **Versionsnummer**.
 
 ### 1. Startseite
 Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts verändert**.
@@ -290,7 +297,7 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 |---|---|---|
 | `PAPERLESS_URL` | `http://paperless:8000` | Adresse von Paperless aus Sicht des Containers (IP:Port oder Containername im selben Docker-Netz) |
 | `PAPERLESS_TOKEN` | – | API-Auth-Token |
-| `PAPERLESS_PUBLIC_URL` | leer | optional: Adresse, unter der Paperless im Browser erreichbar ist. Dann öffnen die Links direkt in Paperless statt in der PDF-Ansicht |
+| `PAPERLESS_PUBLIC_URL` | leer | optional: Adresse, unter der Paperless im Browser erreichbar ist. Ziel der Taste *Paperless öffnen*; außerdem öffnen die Dokument-Links dann direkt in Paperless statt in der PDF-Ansicht |
 | `DOCTYPE_INVOICE` | `Rechnung` | Name des Dokumententyps für Rechnungen |
 | `DOCTYPE_DELIVERY` | `Lieferschein` | Name des Dokumententyps für Lieferscheine |
 | `DEFAULT_TAGS` | `Posteingang` | vorausgewählte Tags für neue Dokumente, mehrere durch Komma getrennt |
@@ -325,6 +332,10 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.8 (03.11.2026)
+- Kopfzeile mit den Tasten **⌂ Start** (zurück zur Startseite) und **Paperless öffnen ↗** (öffnet die Paperless-Instanz in einem neuen Tab) auf jeder Seite
+- Logo und Titel führen ebenfalls zur Startseite
 
 ### Version 0.7 (03.11.2026)
 - **Schutz vor doppeltem Zusammenführen:** Lieferscheine bekommen beim Zusammenführen immer das Tag `LS-zugeordnet` (auch wenn die Originale in den Papierkorb gehen), Rechnungen das neue Tag `LS-ergänzt` (neues Dokument und ggf. erhaltene Original-Rechnung)
