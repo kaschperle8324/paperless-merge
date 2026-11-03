@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.6** · [Änderungen](#versionen)
+**Aktuelle Version: 0.7** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -9,6 +9,7 @@ zu **einem PDF** zusammenführt:
 - das neue Dokument läuft als Dokumententyp **Rechnung**, übernimmt Korrespondent und Speicherpfad der Rechnung
   sowie **alle Tags der Rechnung und der zugehörigen Lieferscheine**
 - **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
+- **nichts wird doppelt zusammengeführt** – bearbeitete Rechnungen und Lieferscheine werden markiert und beim nächsten Lauf ausgeschlossen
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
 - **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
@@ -98,6 +99,7 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 | Rechnungsdatum von / bis | Es werden Rechnungen mit Dokumentdatum in diesem Zeitraum gesucht. Vorbelegt: Anfang des Vormonats bis heute. |
 | Lieferscheine zusätzlich Tage vorher | Lieferscheine liegen meist vor der Rechnung. Hier wird festgelegt, wie viele Tage vor dem Startdatum noch Lieferscheine berücksichtigt werden (Standard 60). |
 | Originale in den Papierkorb verschieben | Siehe [Was mit den Originalen passiert](#was-mit-den-originalen-passiert). Standard: an. |
+| Bereits ergänzte Rechnungen ausblenden | Rechnungen, die schon mit Lieferscheinen zusammengeführt wurden, werden nicht erneut angeboten – siehe [Schutz vor doppeltem Zusammenführen](#schutz-vor-doppeltem-zusammenführen). Standard: an. |
 
 **Korrespondenten**
 - Alle Korrespondenten aus Paperless werden als anklickbare Felder mit der Anzahl ihrer Dokumente angezeigt.
@@ -121,8 +123,8 @@ kommt eine Sicherheitsabfrage.
 
 ### 2. Prüfseite
 Oben steht eine Übersicht: Zeitraum, Anzahl der Rechnungen **mit Vorschlag**, Rechnungen **ohne**
-gefundenen Lieferschein, **freie** Lieferscheine, gewählte Korrespondenten, zusätzliche Tags und ob
-die Originale gelöscht werden.
+gefundenen Lieferschein, **freie** Lieferscheine, ggf. **bereits ergänzte (ausgeblendete)** Rechnungen und
+**schon enthaltene** Lieferscheine, gewählte Korrespondenten, zusätzliche Tags und ob die Originale gelöscht werden.
 
 Darunter steht jede Rechnung als eigene Karte (auf breiten Bildschirmen mehrere nebeneinander):
 - **Vorschaubild** und Link **PDF ansehen** (bzw. *in Paperless öffnen*, wenn `PAPERLESS_PUBLIC_URL` gesetzt ist)
@@ -145,6 +147,16 @@ markiert, bei der Rechnung und beim Lieferschein. So ist auf einen Blick zu sehe
 
 Auch in der Liste der nicht zugeordneten Lieferscheine und im Auswahlfeld zum manuellen Hinzufügen
 stehen die erkannten Nummern.
+
+**Lieferscheine, die schon in einer ergänzten Rechnung stecken**
+Steht die Nummer eines Lieferscheins in einer Rechnung, die bereits mit Lieferscheinen zusammengeführt wurde
+(z. B. ein doppelt eingescannter oder aus dem Papierkorb wiederhergestellter Lieferschein), wird er **nicht**
+erneut vorgeschlagen. Er erscheint im eingeklappten Abschnitt *… stecken schon in einer ergänzten Rechnung*
+mit Verweis auf die Rechnung. Mit **Ausgewählte als zugeordnet markieren** bekommt er das Tag `LS-zugeordnet`
+und taucht künftig gar nicht mehr auf.
+
+**Nicht zugeordnete Lieferscheine** können dort ebenfalls angehakt und mit **Ausgewählte als erledigt markieren**
+dauerhaft ausgeschlossen werden – z. B. Lieferscheine, zu denen es nie eine Rechnung geben wird.
 
 **Anpassen**
 - Haken an der **Rechnung** entfernen → diese Rechnung wird nicht bearbeitet.
@@ -208,7 +220,8 @@ die schon einmal zusammengeführt wurden.
 | | Originale in den Papierkorb (Standard) | Originale behalten |
 |---|---|---|
 | Rechnung + Lieferscheine | wandern in den **Paperless-Papierkorb** und sind dort wiederherstellbar | bleiben unverändert erhalten |
-| Lieferscheine beim nächsten Lauf | – | bekommen das Tag **`LS-zugeordnet`** und werden nicht mehr vorgeschlagen |
+| Lieferscheine | bekommen das Tag **`LS-zugeordnet`** (auch im Papierkorb – wichtig, falls sie wiederhergestellt werden) | bekommen das Tag **`LS-zugeordnet`** |
+| Rechnung | neues Dokument bekommt das Tag **`LS-ergänzt`** | neues Dokument **und** Original-Rechnung bekommen das Tag **`LS-ergänzt`** |
 | Tags von Lieferscheinen und Zusatz-Tags | am neuen Dokument | am neuen Dokument – die Original-Rechnung behält nur ihre eigenen Tags |
 
 ### Tags des neuen Dokuments
@@ -217,12 +230,37 @@ Das zusammengeführte Dokument bekommt **alle Tags zusammen**:
 2. die Tags **aller zugehörigen Lieferscheine**,
 3. die auf der Startseite gewählten **Zusatz-Tags** (z. B. *Posteingang*).
 
-Doppelte Tags werden nur einmal gesetzt. Das interne Tag `LS-zugeordnet` wird nie übernommen.
+Dazu kommt das Tag `LS-ergänzt` (siehe unten). Doppelte Tags werden nur einmal gesetzt. Das Tag `LS-zugeordnet` wird nie übernommen.
 Technisch werden die Tags kurz vor dem Zusammenführen an die Rechnung gehängt, weil Paperless die
 Metadaten des neuen Dokuments von der Rechnung übernimmt. Bleiben die Originale erhalten, werden diese
 Tags danach an der Original-Rechnung wieder entfernt.
 
 Für den ersten Lauf empfiehlt es sich, die Originale zu **behalten** und einen kurzen Zeitraum zu wählen.
+
+### Schutz vor doppeltem Zusammenführen
+Damit eine Rechnung nicht bei jedem Lauf erneut mit ihren Lieferscheinen zusammengeführt wird, werden beim
+Zusammenführen **immer** zwei Tags gesetzt (beide werden bei Bedarf automatisch angelegt):
+
+| Tag | an | Wirkung beim nächsten Lauf |
+|---|---|---|
+| `LS-zugeordnet` | jedem verwendeten Lieferschein | Lieferschein wird nicht mehr gesucht |
+| `LS-ergänzt` | der neuen Rechnung (und einer erhaltenen Original-Rechnung) | Rechnung wird ausgeblendet |
+
+Zusätzlich erkennt die Erweiterung auch **ältere** zusammengeführte Rechnungen ohne Tag – Paperless legt das
+zusammengeführte PDF immer mit dem Dateinamen `…_merged.pdf` an. Das gilt auch für Dokumente, die direkt in
+Paperless zusammengeführt wurden.
+
+Ausgeblendete Rechnungen werden trotzdem für die Zuordnung verwendet: Steht die Nummer eines Lieferscheins in
+einer schon ergänzten Rechnung, wird dieser Lieferschein keiner anderen Rechnung zugeschlagen, sondern als
+*schon enthalten* angezeigt. *Unsichere* Vorschläge (nur Korrespondent + Datum) gehen nie an ausgeblendete Rechnungen.
+
+Soll an eine schon ergänzte Rechnung bewusst ein weiterer Lieferschein angehängt werden:
+- auf der Startseite **Bereits ergänzte Rechnungen ausblenden** abschalten – die Rechnungen erscheinen dann mit dem
+  Hinweis *bereits ergänzt*, oder
+- den Lieferschein über [Rechnungen zu Lieferscheinen suchen](#4-rechnungen-zu-lieferscheinen-suchen) zuordnen –
+  auch dort sind solche Rechnungen mit *bereits ergänzt* gekennzeichnet.
+
+Um eine Rechnung oder einen Lieferschein wieder freizugeben, einfach das Tag in Paperless entfernen.
 
 ## Wie die Zuordnung funktioniert
 1. **Nummern finden:** Im OCR-Text werden Nummern hinter Begriffen wie *Lieferschein*, *Lieferschein-Nr.*,
@@ -237,7 +275,9 @@ Für den ersten Lauf empfiehlt es sich, die Originale zu **behalten** und einen 
    Unterschiedliche Korrespondenten stufen einen Treffer auf *mittel* herab.
 5. **Rückfallebene:** Ohne Nummerntreffer wird ein Lieferschein desselben Korrespondenten vorgeschlagen,
    der bis zu `FALLBACK_DAYS` (Standard 45) Tage vor bis 3 Tage nach der Rechnung datiert ist – immer als *unsicher*.
-6. **Eindeutigkeit:** Jeder Lieferschein wird höchstens **einer** Rechnung zugeordnet – der mit dem besten
+6. **Bereits ergänzt:** Lieferscheine mit `LS-zugeordnet` werden gar nicht geladen. Rechnungen mit `LS-ergänzt`
+   oder Dateiname `…_merged.pdf` werden nicht angeboten, binden aber Lieferscheine mit eindeutigem Nummerntreffer.
+7. **Eindeutigkeit:** Jeder Lieferschein wird höchstens **einer** Rechnung zugeordnet – der mit dem besten
    Treffer bzw. dem nächstliegenden Datum. Dafür werden intern auch Rechnungen kurz vor und nach dem
    gewählten Zeitraum berücksichtigt, angezeigt werden aber nur Rechnungen aus dem Zeitraum.
 
@@ -255,6 +295,7 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `DOCTYPE_DELIVERY` | `Lieferschein` | Name des Dokumententyps für Lieferscheine |
 | `DEFAULT_TAGS` | `Posteingang` | vorausgewählte Tags für neue Dokumente, mehrere durch Komma getrennt |
 | `DONE_TAG` | `LS-zugeordnet` | Tag für bereits verwendete Lieferscheine (wird bei Bedarf automatisch angelegt) |
+| `MERGED_TAG` | `LS-ergänzt` | Tag für Rechnungen, an die Lieferscheine angehängt wurden (wird bei Bedarf automatisch angelegt) |
 | `FALLBACK_DAYS` | `45` | Zeitfenster für *unsichere* Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
 | `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung für „Lieferscheine zusätzlich Tage vorher“ |
 | `VERIFY_SSL` | `true` | bei HTTPS mit selbstsigniertem Zertifikat auf `false` setzen |
@@ -284,6 +325,14 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.7 (03.11.2026)
+- **Schutz vor doppeltem Zusammenführen:** Lieferscheine bekommen beim Zusammenführen immer das Tag `LS-zugeordnet` (auch wenn die Originale in den Papierkorb gehen), Rechnungen das neue Tag `LS-ergänzt` (neues Dokument und ggf. erhaltene Original-Rechnung)
+- bereits ergänzte Rechnungen werden beim nächsten Lauf ausgeblendet – erkannt am Tag oder am Paperless-Dateinamen `…_merged.pdf`, also auch ältere Zusammenführungen
+- Lieferscheine, deren Nummer schon in einer ergänzten Rechnung steht, werden nicht erneut vorgeschlagen und gesondert angezeigt
+- neue Knöpfe zum dauerhaften Ausschließen: *Ausgewählte als zugeordnet markieren* und *Ausgewählte als erledigt markieren*
+- Option *Bereits ergänzte Rechnungen ausblenden* auf der Startseite; Kennzeichnung *bereits ergänzt* auch in der Suche
+- interne Tags `LS-zugeordnet` / `LS-ergänzt` werden bei der Tag-Auswahl nicht mehr angeboten
 
 ### Version 0.6 (03.11.2026)
 - neue Funktion: **Rechnungen zu Lieferscheinen suchen** – nicht zugeordnete Lieferscheine auswählen und in der ganzen Paperless-Instanz nach Dokumenten suchen, die deren Nummer enthalten

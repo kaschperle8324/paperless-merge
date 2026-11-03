@@ -18,7 +18,8 @@ services:
       # PAPERLESS_PUBLIC_URL: "http://192.168.1.50:8000"
       DOCTYPE_INVOICE: "Rechnung"
       DOCTYPE_DELIVERY: "Lieferschein"
-      DONE_TAG: "LS-zugeordnet"
+      DONE_TAG: "LS-zugeordnet"           # Tag an verwendeten Lieferscheinen
+      MERGED_TAG: "LS-ergänzt"            # Tag an Rechnungen mit ergänzten Lieferscheinen
       # vorausgewählte Tags für die neuen Dokumente (kommagetrennt, im Formular änderbar)
       DEFAULT_TAGS: "Posteingang"
       FALLBACK_DAYS: "45"
