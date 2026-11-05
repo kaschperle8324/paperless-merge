@@ -13,19 +13,22 @@ Ablauf:
 import datetime as dt
 import difflib
 import hashlib
+import hmac
 import io
 import json
 import os
 import shutil
 import tempfile
 import re
+import secrets
 import threading
 import time
 import uuid
 from functools import wraps
 
 import requests
-from flask import Flask, Response, abort, redirect, render_template_string, request, url_for
+from flask import Flask, Response, abort, redirect, render_template_string, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # --------------------------------------------------------------------------- Konfiguration
 PAPERLESS_URL = os.environ.get("PAPERLESS_URL", "http://paperless:8000").rstrip("/")
@@ -1057,14 +1060,130 @@ def search_invoices_for(pl, ls, nums, type_ids, before, after, unlimited, same_c
 
 
 # --------------------------------------------------------------------------- Web-Oberfläche
+# --------------------------------------------------------------------------- Anmeldung
+# Benutzer wird beim ersten Aufruf in der Oberfläche angelegt und in DATA_DIR/benutzer.json gespeichert
+# (Passwort nur als Hash). Alternativ fest über APP_USER/APP_PASSWORD. LOGIN_REQUIRED=false schaltet die
+# Anmeldung ab (nur sinnvoll, wenn ein vorgeschalteter Proxy wie Authentik den Zugang schützt).
+USERS_FILE = os.environ.get("USERS_FILE", os.path.join(DATA_DIR, "benutzer.json"))
+LOGIN_REQUIRED = os.environ.get("LOGIN_REQUIRED", "true").strip().lower() not in ("0", "false", "no", "off")
+_FAILED = {}
+_FAILED_LOCK = threading.Lock()
+
+
+def _secret_key():
+    env = os.environ.get("SECRET_KEY", "").strip()
+    if env:
+        return env
+    path = os.path.join(DATA_DIR, "secret.key")
+    try:
+        with open(path, encoding="utf-8") as f:
+            key = f.read().strip()
+            if len(key) >= 32:
+                return key
+    except OSError:
+        pass
+    key = secrets.token_hex(32)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(key)
+        os.chmod(path, 0o600)
+    except OSError:
+        pass  # ohne beschreibbares Datenverzeichnis gilt der Schlüssel nur bis zum Neustart
+    return key
+
+
+app.secret_key = _secret_key()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  SESSION_COOKIE_NAME="paperless_merge", PERMANENT_SESSION_LIFETIME=dt.timedelta(days=30))
+
+
+def load_account():
+    """Das eine Benutzerkonto: aus APP_USER/APP_PASSWORD oder aus benutzer.json. None = noch keins angelegt."""
+    if APP_USER and APP_PASSWORD:
+        return {"username": APP_USER, "env": True,
+                "version": hashlib.sha256(APP_PASSWORD.encode()).hexdigest()[:16]}
+    try:
+        with open(USERS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("username") and data.get("password_hash"):
+            return {"username": data["username"], "password_hash": data["password_hash"], "env": False,
+                    "version": hashlib.sha256(data["password_hash"].encode()).hexdigest()[:16]}
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def save_account(username, password):
+    os.makedirs(os.path.dirname(USERS_FILE) or ".", exist_ok=True)
+    tmp = USERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"username": username, "password_hash": generate_password_hash(password),
+                   "created": dt.datetime.now().isoformat(timespec="seconds")}, f, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, USERS_FILE)
+
+
+def check_credentials(account, username, password):
+    if not account or not hmac.compare_digest(username.strip().lower(), account["username"].lower()):
+        return False
+    if account["env"]:
+        return hmac.compare_digest(password, APP_PASSWORD)
+    return check_password_hash(account["password_hash"], password)
+
+
+def validate_new_account(username, password, password2):
+    if not re.fullmatch(r"[A-Za-z0-9._@-]{3,40}", username or ""):
+        return "Benutzername: 3–40 Zeichen, erlaubt sind Buchstaben, Ziffern und . _ - @"
+    if len(password or "") < 8:
+        return "Das Passwort muss mindestens 8 Zeichen lang sein."
+    if password != password2:
+        return "Die beiden Passwörter stimmen nicht überein."
+    return None
+
+
+def _too_many_failures(ip):
+    now = time.time()
+    with _FAILED_LOCK:
+        recent = [t for t in _FAILED.get(ip, []) if now - t < 600]
+        _FAILED[ip] = recent
+        return len(recent) >= 5
+
+
+def _note_failure(ip):
+    with _FAILED_LOCK:
+        _FAILED.setdefault(ip, []).append(time.time())
+
+
+def _safe_next(target):
+    return target if target and target.startswith("/") and not target.startswith("//") else None
+
+
+def logged_in_user():
+    if not LOGIN_REQUIRED:
+        return None
+    acc = load_account()
+    if acc and session.get("user") == acc["username"] and session.get("v") == acc["version"]:
+        return acc["username"]
+    return None
+
+
 def require_auth(f):
     @wraps(f)
     def wrapper(*a, **kw):
-        if APP_USER and APP_PASSWORD:
-            auth = request.authorization
-            if not auth or auth.username != APP_USER or auth.password != APP_PASSWORD:
-                return Response("Anmeldung erforderlich", 401,
-                                {"WWW-Authenticate": 'Basic realm="Paperless Merge"'})
+        if not LOGIN_REQUIRED:
+            return f(*a, **kw)
+        acc = load_account()
+        wants_html = request.method == "GET" and "text/html" in (request.headers.get("Accept") or "text/html")
+        if acc is None:
+            return redirect(url_for("setup")) if wants_html or request.method == "POST" else ("", 401)
+        if session.get("user") != acc["username"] or session.get("v") != acc["version"]:
+            if not wants_html and request.method != "POST":
+                return "", 401
+            return redirect(url_for("login", next=request.full_path.rstrip("?") if request.method == "GET" else None))
         return f(*a, **kw)
     return wrapper
 
@@ -1144,6 +1263,9 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.authbox{max-width:440px;margin:6vh auto 0}
+.authbox h3{font-size:1.25rem}
+.authbox input{margin-bottom:12px}
 code{word-break:break-all}
 .pagegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-top:12px}
 .pg{border:2px solid var(--line);border-radius:10px;padding:6px;background:var(--surface2);display:flex;flex-direction:column;gap:4px;cursor:pointer}
@@ -1176,10 +1298,11 @@ header{flex-wrap:wrap}
 ul{padding-left:18px}
 </style></head><body>
 <header><a href="{{ url_for('index') }}" class="home"><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></a>
-<nav class="hnav"><a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
+<nav class="hnav">{% if show_nav %}<a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
 <a class="hbtn" href="{{ url_for('audit') }}">🔎 Prüfen</a>
 <a class="hbtn" href="{{ url_for('settings') }}">⚙ Einstellungen</a>
 {% if paperless_link %}<a class="hbtn" href="{{ paperless_link }}" target="_blank" rel="noopener">Paperless öffnen ↗</a>{% endif %}
+{% if current_user %}<a class="hbtn" href="{{ url_for('logout') }}" title="Abmelden">👤 {{ current_user }} · Abmelden</a>{% endif %}{% endif %}
 <span class="ver">v{{ version }}</span></nav></header>
 <main>
 {% block body %}{% endblock %}</main></body></html>"""
@@ -1188,6 +1311,8 @@ ul{padding-left:18px}
 def page(body, **ctx):
     ctx.setdefault("version", VERSION)
     ctx.setdefault("paperless_link", PAPERLESS_BROWSER_URL)
+    ctx.setdefault("current_user", logged_in_user())
+    ctx.setdefault("show_nav", True)
     return render_template_string(BASE.replace("{% block body %}{% endblock %}", body), **ctx)
 
 
@@ -1581,7 +1706,7 @@ SETTINGS = """
    Texterkennung und OpenAI für die Auswertung. Beide sind optional. Die Zugänge werden auf dem Server in
    <code>{{ settings_file }}</code> gespeichert{% if not writable %} – <b style="color:var(--bad)">das Verzeichnis ist nicht beschreibbar,
    bitte in der docker-compose.yml das Volume <code>./data:/data</code> einbinden</b>{% endif %}.
-   {% if not protected %}<br><b>Tipp:</b> Mit <code>APP_USER</code> / <code>APP_PASSWORD</code> lässt sich die Oberfläche mit einem Login schützen.{% endif %}</p>
+   {% if not protected %}<br><b>Achtung:</b> Die Anmeldung ist abgeschaltet (<code>LOGIN_REQUIRED=false</code>) – der Zugang muss anderweitig geschützt sein.{% endif %}</p>
  <div class="cols">
   <section>
    <h3>📄 Texterkennung (OCR)</h3>
@@ -1629,6 +1754,23 @@ SETTINGS = """
  </div>
  <div style="margin-top:22px"><button type="submit" name="action" value="save">Speichern</button></div>
 </form>
+{% if login_required %}
+<form class="card" method="post" action="{{ url_for('change_password') }}" autocomplete="off">
+  <h3>🔐 Anmeldung</h3>
+  {% if account_env %}<p class="meta">Der Zugang ist über <code>APP_USER</code> / <code>APP_PASSWORD</code> in der docker-compose.yml
+    festgelegt und kann hier nicht geändert werden.</p>
+  {% else %}
+  <p class="meta" style="margin-top:0">Angemeldet als <b>{{ current_user }}</b>. Nach einer Änderung muss man sich überall neu anmelden.</p>
+  <div class="grid2">
+    <div><label class="f">Neuer Benutzername (optional)</label><input type="text" name="username" value="" placeholder="{{ current_user }}" autocomplete="username"></div>
+    <div><label class="f">Aktuelles Passwort</label><input type="password" name="current" required autocomplete="current-password"></div>
+    <div><label class="f">Neues Passwort</label><input type="password" name="password" required minlength="8" autocomplete="new-password"></div>
+    <div><label class="f">Neues Passwort wiederholen</label><input type="password" name="password2" required minlength="8" autocomplete="new-password"></div>
+  </div>
+  <div style="margin-top:14px"><button class="sec">Zugang ändern</button></div>
+  {% endif %}
+</form>
+{% endif %}
 <script>
 const defaults = {{ ai_defaults|tojson }};
 document.getElementById('aiprov').addEventListener('change', e => {
@@ -1636,6 +1778,41 @@ document.getElementById('aiprov').addEventListener('change', e => {
   document.getElementById('aimodel').placeholder = defaults[e.target.value] || '';
 });
 </script>
+"""
+
+SETUP = """
+<form class="card authbox" method="post" action="{{ url_for('setup') }}" autocomplete="off">
+  <h3>👋 Willkommen – Zugang anlegen</h3>
+  <p class="meta" style="margin-top:0">Beim ersten Start wird ein Benutzer für diese Oberfläche angelegt.
+    Danach ist eine Anmeldung nötig. Das Passwort wird nur verschlüsselt (als Hash) gespeichert.</p>
+  {% if error %}<div class="card err" style="margin:0 0 12px">{{ error }}</div>{% endif %}
+  {% if not writable %}<div class="card err" style="margin:0 0 12px">Das Datenverzeichnis <code>{{ data_dir }}</code> ist nicht beschreibbar.
+    Bitte in der docker-compose.yml das Volume <code>./data:/data</code> einbinden und den Container neu starten.</div>{% endif %}
+  <label class="f">Benutzername</label>
+  <input type="text" name="username" value="{{ username }}" required autofocus minlength="3" maxlength="40" autocomplete="username">
+  <label class="f">Passwort (mindestens 8 Zeichen)</label>
+  <input type="password" name="password" required minlength="8" autocomplete="new-password">
+  <label class="f">Passwort wiederholen</label>
+  <input type="password" name="password2" required minlength="8" autocomplete="new-password">
+  <button {{ 'disabled' if not writable }}>Zugang anlegen</button>
+</form>
+"""
+
+LOGIN = """
+<form class="card authbox" method="post" action="{{ url_for('login') }}">
+  <h3>🔐 Anmelden</h3>
+  {% if info %}<div class="card ok" style="margin:0 0 12px">{{ info }}</div>{% endif %}
+  {% if error %}<div class="card err" style="margin:0 0 12px">{{ error }}</div>{% endif %}
+  <input type="hidden" name="next" value="{{ next or '' }}">
+  <label class="f">Benutzername</label>
+  <input type="text" name="username" value="{{ username }}" required autofocus autocomplete="username">
+  <label class="f">Passwort</label>
+  <input type="password" name="password" required autocomplete="current-password">
+  <label class="switch" style="margin:0 0 16px"><input type="checkbox" name="remember" value="1" checked> angemeldet bleiben (30 Tage)</label>
+  <button>Anmelden</button>
+  <p class="meta">Passwort vergessen? Die Datei <code>benutzer.json</code> im Datenverzeichnis löschen –
+    beim nächsten Aufruf kann ein neuer Zugang angelegt werden.</p>
+</form>
 """
 
 RESULT = """
@@ -2025,11 +2202,93 @@ def cleanup_titles():
     return page(CLEANUP, msg=msg, errors=errors)
 
 
+@app.route("/einrichten", methods=["GET", "POST"])
+def setup():
+    if not LOGIN_REQUIRED or load_account() is not None:
+        return redirect(url_for("index"))
+    error, username = None, ""
+    writable = os.access(os.path.dirname(USERS_FILE) or ".", os.W_OK) or not os.path.exists(os.path.dirname(USERS_FILE) or ".")
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        error = validate_new_account(username, request.form.get("password", ""), request.form.get("password2", ""))
+        if not error:
+            try:
+                save_account(username, request.form["password"])
+            except OSError as e:
+                error = f"Zugang konnte nicht gespeichert werden ({e}). Ist das Volume ./data:/data eingebunden?"
+        if not error:
+            acc = load_account()
+            session.clear()
+            session.permanent = True
+            session.update(user=acc["username"], v=acc["version"])
+            return redirect(url_for("index"))
+    return page(SETUP, error=error, username=username, writable=writable, data_dir=DATA_DIR, show_nav=False)
+
+
+@app.route("/anmelden", methods=["GET", "POST"])
+def login():
+    if not LOGIN_REQUIRED:
+        return redirect(url_for("index"))
+    acc = load_account()
+    if acc is None:
+        return redirect(url_for("setup"))
+    nxt = _safe_next(request.values.get("next"))
+    error, username = None, ""
+    if request.method == "POST":
+        ip = request.remote_addr or "?"
+        username = request.form.get("username", "").strip()
+        if _too_many_failures(ip):
+            error = "Zu viele Fehlversuche – bitte 10 Minuten warten."
+        elif check_credentials(acc, username, request.form.get("password", "")):
+            session.clear()
+            session.permanent = request.form.get("remember") == "1"
+            session.update(user=acc["username"], v=acc["version"])
+            return redirect(nxt or url_for("index"))
+        else:
+            _note_failure(ip)
+            time.sleep(1)
+            error = "Benutzername oder Passwort falsch."
+    info = "Du wurdest abgemeldet." if request.args.get("abgemeldet") else None
+    return page(LOGIN, error=error, info=info, username=username, next=nxt, show_nav=False)
+
+
+@app.route("/abmelden")
+def logout():
+    session.clear()
+    return redirect(url_for("login", abgemeldet=1))
+
+
+@app.route("/einstellungen/zugang", methods=["POST"])
+@require_auth
+def change_password():
+    acc = load_account()
+    msgs = []
+    if acc is None or acc["env"]:
+        msgs.append(("err", "Der Zugang kann hier nicht geändert werden."))
+    elif not check_credentials(acc, acc["username"], request.form.get("current", "")):
+        time.sleep(1)
+        msgs.append(("err", "Das aktuelle Passwort ist falsch."))
+    else:
+        username = request.form.get("username", "").strip() or acc["username"]
+        error = validate_new_account(username, request.form.get("password", ""), request.form.get("password2", ""))
+        if error:
+            msgs.append(("err", error))
+        else:
+            try:
+                save_account(username, request.form["password"])
+                new = load_account()
+                session.update(user=new["username"], v=new["version"])
+                msgs.append(("ok", "✓ Zugang geändert. Andere Geräte müssen sich neu anmelden."))
+            except OSError as e:
+                msgs.append(("err", f"Speichern nicht möglich: {e}"))
+    return settings(msgs)
+
+
 @app.route("/einstellungen", methods=["GET", "POST"])
 @require_auth
-def settings():
-    msgs = []
-    if request.method == "POST":
+def settings(msgs=None):
+    msgs = list(msgs or [])
+    if request.method == "POST" and request.endpoint == "settings":
         f = request.form
         cur = load_settings()
         new = {"ai": dict(cur["ai"]), "ocr": dict(cur["ocr"])}
@@ -2077,7 +2336,8 @@ def settings():
     writable = os.access(os.path.dirname(SETTINGS_FILE) or ".", os.W_OK)
     return page(SETTINGS, msgs=msgs, st=st, ai=ai_cfg(st), ocr=ocr_cfg(st), mask=mask_key,
                 ai_defaults={k: v[1] for k, v in AI_PROVIDERS.items()}, ocr_default=OCR_PROVIDERS["mistral"][1],
-                settings_file=SETTINGS_FILE, writable=writable, protected=bool(APP_USER and APP_PASSWORD))
+                settings_file=SETTINGS_FILE, writable=writable, protected=LOGIN_REQUIRED,
+                login_required=LOGIN_REQUIRED, account_env=bool(APP_USER and APP_PASSWORD))
 
 
 @app.route("/audit")

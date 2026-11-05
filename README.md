@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.10** · [Änderungen](#versionen)
+**Aktuelle Version: 0.11** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -25,6 +25,7 @@ die Paperless-API. Paperless selbst wird nicht verändert.
 - [Voraussetzungen](#voraussetzungen)
 - [Installation](#installation)
 - [Aktualisieren](#aktualisieren)
+- [Anmeldung](#anmeldung)
 - [Bedienung](#bedienung)
   - [1. Startseite](#1-startseite)
   - [2. Prüfseite](#2-prüfseite)
@@ -79,8 +80,8 @@ Statt `latest` kann auch eine feste Version verwendet werden, z. B.
 `ghcr.io/kaschperle8324/paperless-merge:0.3`. Dann wird erst aktualisiert, wenn die Versionsnummer
 in der Compose-Datei geändert wird.
 
-> **Hinweis:** Die Oberfläche hat standardmäßig keinen Login. Entweder nur im Heimnetz betreiben,
-> hinter einen Reverse-Proxy mit Anmeldung hängen oder `APP_USER` / `APP_PASSWORD` setzen.
+**Erster Aufruf:** Es erscheint das Fenster **„Willkommen – Zugang anlegen“**. Dort Benutzername und Passwort
+(mindestens 8 Zeichen) festlegen – danach ist man direkt angemeldet. Siehe [Anmeldung](#anmeldung).
 
 ## Aktualisieren
 ```bash
@@ -91,6 +92,31 @@ Danach die Seite im Browser mit **Strg + F5** neu laden. Ob die neue Version lä
 Versionsnummer oben rechts in der Oberfläche.
 
 ---
+
+## Anmeldung
+Die Oberfläche ist durch eine Anmeldung geschützt.
+
+- **Erster Start:** Beim ersten Aufruf erscheint das Fenster *Willkommen – Zugang anlegen*. Benutzername (3–40 Zeichen)
+  und Passwort (mindestens 8 Zeichen, zweimal eingeben) festlegen. Weitere Benutzer gibt es nicht.
+- **Anmelden:** Benutzername (Groß-/Kleinschreibung egal) und Passwort. Mit *angemeldet bleiben* gilt die Anmeldung 30 Tage,
+  sonst bis der Browser geschlossen wird. Nach der Anmeldung geht es zur ursprünglich aufgerufenen Seite weiter.
+- **Abmelden:** Taste *👤 Benutzer · Abmelden* in der Kopfzeile.
+- **Zugang ändern:** unter **⚙ Einstellungen → Anmeldung** – mit aktuellem Passwort; Benutzername optional. Danach müssen sich
+  alle anderen Geräte neu anmelden.
+- **Passwort vergessen:** Im Datenverzeichnis (`./data` neben der Compose-Datei) die Datei `benutzer.json` löschen.
+  Beim nächsten Aufruf kann ein neuer Zugang angelegt werden; Einstellungen und KI-Zugänge bleiben erhalten.
+
+**Sicherheit**
+- Das Passwort wird nur als Hash (scrypt) in `/data/benutzer.json` gespeichert, die Datei ist nur für den Container lesbar.
+- Nach 5 Fehlversuchen innerhalb von 10 Minuten wird die Anmeldung von dieser Adresse für 10 Minuten gesperrt.
+- Der Schlüssel für die Anmelde-Sitzungen wird beim ersten Start erzeugt und in `/data/secret.key` abgelegt.
+- Ohne das Volume `./data:/data` kann kein Zugang angelegt werden – das Einrichtungsfenster weist darauf hin.
+
+**Alternativen**
+- `APP_USER` / `APP_PASSWORD` in der Compose-Datei legen den Zugang fest vor; das Einrichtungsfenster entfällt und der Zugang
+  ist in der Oberfläche nicht änderbar.
+- `LOGIN_REQUIRED: "false"` schaltet die Anmeldung ab – nur sinnvoll, wenn ein vorgeschalteter Dienst wie Authentik
+  oder ein Reverse-Proxy mit Anmeldung den Zugang schützt.
 
 ## Bedienung
 Die Oberfläche nutzt die volle Bildschirmbreite, passt sich an Handy und Tablet an und schaltet
@@ -103,6 +129,7 @@ automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
 - **Paperless öffnen ↗** – öffnet die Paperless-Instanz in einem neuen Tab. Verwendet wird `PAPERLESS_PUBLIC_URL`,
   wenn gesetzt, sonst `PAPERLESS_URL`. Steht in `PAPERLESS_URL` ein Containername (z. B. `http://paperless:8000`),
   den der Browser nicht kennt, `PAPERLESS_PUBLIC_URL` mit der Adresse setzen, unter der Paperless im Browser aufgerufen wird.
+- **👤 Benutzer · Abmelden** – zeigt, wer angemeldet ist, und meldet ab.
 - rechts die laufende **Versionsnummer**.
 
 ### 1. Startseite
@@ -286,7 +313,7 @@ Hinweise:
 - Je Dienst lässt sich eine **Höchstzahl je Durchlauf** festlegen (Standard: 20 Dokumente Texterkennung, 30 Anfragen Auswertung).
 - Gespeichert wird in `/data/einstellungen.json` (nur für den Container lesbar). Dafür muss das Volume `./data:/data`
   eingebunden sein – sonst zeigt die Einstellungsseite einen Hinweis.
-- Da hier Zugangsdaten hinterlegt sind, empfiehlt sich ein Login über `APP_USER` / `APP_PASSWORD` oder ein Reverse-Proxy mit Anmeldung.
+- Die Seite ist wie die ganze Oberfläche nur nach [Anmeldung](#anmeldung) erreichbar.
 - Die bisherigen Umgebungsvariablen (`AI_…`, `OCR_…`) funktionieren weiter und dienen als **Vorbelegung**, solange in der
   Oberfläche nichts gespeichert wurde.
 
@@ -419,7 +446,10 @@ Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorra
 | `AI_CACHE_FILE` | `/data/ki-cache.json` | Zwischenspeicher für Ergebnisse von Texterkennung und Auswertung |
 | `SETTINGS_FILE` | `/data/einstellungen.json` | Datei, in der die Einstellungen aus der Oberfläche gespeichert werden |
 | `AUTO_CLEAN_TITLES` | `true` | „(merged)“ nach dem Zusammenführen automatisch aus den Titeln entfernen |
-| `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche (beide setzen) |
+| `APP_USER` / `APP_PASSWORD` | leer | Zugang fest vorgeben (beide setzen) – statt ihn beim ersten Start in der Oberfläche anzulegen |
+| `LOGIN_REQUIRED` | `true` | `false` schaltet die Anmeldung ab (nur hinter Authentik o. Ä.) |
+| `SECRET_KEY` | automatisch | Schlüssel für die Anmelde-Sitzungen; ohne Angabe wird er erzeugt und in `/data/secret.key` gespeichert |
+| `USERS_FILE` | `/data/benutzer.json` | Datei mit dem angelegten Zugang |
 | `TZ` | – | Zeitzone, z. B. `Europe/Berlin` |
 
 ---
@@ -439,11 +469,20 @@ Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorra
 | *… fehlgeschlagen* – HTTP 404 / Modell unbekannt | Modellname unter ⚙ Einstellungen prüfen – er muss genau so beim Anbieter existieren. |
 | *Höchstzahl an Anfragen erreicht* | Höchstzahl unter ⚙ Einstellungen erhöhen oder den Zeitraum verkleinern. |
 | Prüfung meldet *Konnte nicht geprüft werden* | Die PDF des Dokuments ließ sich nicht laden oder lesen – Dokument in Paperless öffnen und ggf. *erneut verarbeiten*. |
+| Passwort vergessen | `benutzer.json` im Datenverzeichnis löschen und die Seite neu aufrufen – dann einen neuen Zugang anlegen. |
+| *Zu viele Fehlversuche* | 10 Minuten warten. |
+| Nach jedem Neustart abgemeldet | Das Volume `./data:/data` fehlt – dann wird der Sitzungsschlüssel nicht gespeichert. |
 | Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
 
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.11 (05.11.2026)
+- **Anmeldung** für die Oberfläche: beim ersten Aufruf Fenster zum Anlegen von Benutzer und Passwort, danach Anmeldeseite mit *angemeldet bleiben*
+- Abmelden über die Kopfzeile, Zugang (Benutzername/Passwort) unter ⚙ Einstellungen änderbar
+- Passwort nur als Hash gespeichert, Sperre nach 5 Fehlversuchen, Sitzungsschlüssel in `/data`
+- `APP_USER` / `APP_PASSWORD` legen den Zugang weiterhin fest vor (jetzt mit Anmeldeseite statt Browser-Fenster); `LOGIN_REQUIRED=false` für den Betrieb hinter Authentik o. Ä.
 
 ### Version 0.10 (05.11.2026)
 - neue Seite **⚙ Einstellungen**: KI-Zugänge direkt in der Oberfläche einrichten, mit Statusanzeige und Test-Knopf je Dienst; Schlüssel werden maskiert angezeigt

@@ -36,11 +36,13 @@ services:
       # --- KI-Unterstützung (optional) ---
       # Zugänge werden in der Oberfläche unter "⚙ Einstellungen" eingerichtet und in ./data gespeichert.
       # Alternativ als Vorbelegung: OCR_PROVIDER/OCR_API_KEY (Mistral OCR), AI_PROVIDER/AI_API_KEY/AI_MODEL (Auswertung)
-      # optionaler Login für die Oberfläche – empfohlen, wenn KI-Zugänge hinterlegt sind
+      # Anmeldung: Benutzer und Passwort werden beim ersten Aufruf in der Oberfläche angelegt.
+      # Optional fest vorgeben (dann entfällt das Einrichtungsfenster):
       # APP_USER: "markus"
       # APP_PASSWORD: "geheim"
+      # LOGIN_REQUIRED: "false"              # nur wenn Authentik o. Ä. den Zugang schützt
     volumes:
-      - ./data:/data                         # Einstellungen und KI-Zwischenspeicher
+      - ./data:/data                         # Zugang, Einstellungen und KI-Zwischenspeicher
 
 # Nur wenn du Paperless per Containername ansprechen willst:
 # Netzwerk von Paperless hier eintragen (docker network ls) und oben beim Service
