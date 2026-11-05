@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.9** · [Änderungen](#versionen)
+**Aktuelle Version: 0.10** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -14,7 +14,7 @@ zu **einem PDF** zusammenführt:
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
 - **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
 - **Prüfung bereits zusammengeführter Rechnungen** auf doppelt enthaltene Lieferscheine – mit Seitenvorschau und Korrektur
-- optionale **KI-Unterstützung** (OpenAI, Mistral oder andere OpenAI-kompatible API) für schwer lesbare Dokumente
+- optionale **KI-Unterstützung**, in der Oberfläche einstellbar: **Texterkennung** (Mistral OCR) und **Auswertung** (OpenAI, Mistral oder andere OpenAI-kompatible API) – auch kombiniert
 
 Die Erweiterung läuft als eigener Docker-Container neben Paperless und arbeitet ausschließlich über
 die Paperless-API. Paperless selbst wird nicht verändert.
@@ -63,6 +63,8 @@ services:
       PAPERLESS_TOKEN: "HIER_TOKEN_EINTRAGEN"     # API-Auth-Token aus Paperless
       DEFAULT_TAGS: "Posteingang"                 # vorausgewählte Tags für neue Dokumente
       TZ: "Europe/Berlin"
+    volumes:
+      - ./data:/data                              # Einstellungen (KI-Zugänge) und Zwischenspeicher
 ```
 
 `PAPERLESS_URL` und `PAPERLESS_TOKEN` anpassen und starten:
@@ -97,6 +99,7 @@ automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
 **Kopfzeile** (auf jeder Seite)
 - **⌂ Start** – zurück zur Startseite; ein Klick auf das Logo bzw. den Titel geht ebenfalls dorthin.
 - **🔎 Prüfen** – [zusammengeführte Rechnungen prüfen](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren).
+- **⚙ Einstellungen** – [KI-Zugänge einrichten](#ki-unterstützung).
 - **Paperless öffnen ↗** – öffnet die Paperless-Instanz in einem neuen Tab. Verwendet wird `PAPERLESS_PUBLIC_URL`,
   wenn gesetzt, sonst `PAPERLESS_URL`. Steht in `PAPERLESS_URL` ein Containername (z. B. `http://paperless:8000`),
   den der Browser nicht kennt, `PAPERLESS_PUBLIC_URL` mit der Adresse setzen, unter der Paperless im Browser aufgerufen wird.
@@ -111,7 +114,7 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 | Rechnungsdatum von / bis | Es werden Rechnungen mit Dokumentdatum in diesem Zeitraum gesucht. Vorbelegt: Anfang des Vormonats bis heute. |
 | Lieferscheine zusätzlich Tage vorher | Lieferscheine liegen meist vor der Rechnung. Hier wird festgelegt, wie viele Tage vor dem Startdatum noch Lieferscheine berücksichtigt werden (Standard 60). |
 | Originale in den Papierkorb verschieben | Siehe [Was mit den Originalen passiert](#was-mit-den-originalen-passiert). Standard: an. |
-| 🤖 KI-Unterstützung nutzen | Nur sichtbar, wenn die KI eingerichtet ist – siehe [KI-Unterstützung](#ki-unterstützung). Standard: an. *Verbindung testen* prüft Schlüssel und Modell. |
+| 🤖 KI-Unterstützung nutzen | Nur sichtbar, wenn Texterkennung oder Auswertung unter **⚙ Einstellungen** eingerichtet ist – siehe [KI-Unterstützung](#ki-unterstützung). Standard: an. |
 | Bereits ergänzte Rechnungen ausblenden | Rechnungen, die schon mit Lieferscheinen zusammengeführt wurden, werden nicht erneut angeboten – siehe [Schutz vor doppeltem Zusammenführen](#schutz-vor-doppeltem-zusammenführen). Standard: an. |
 
 **Korrespondenten**
@@ -233,7 +236,9 @@ zusammengeführt wurden (Tag `LS-ergänzt` oder Paperless-Datei `…_merged.pdf`
 zusammengeführte Dokumente).
 
 **Ablauf**
-1. Zeitraum (Rechnungsdatum) wählen und **Prüfung starten**. Jede PDF wird einmal aus Paperless geladen und Seite für
+1. Zeitraum (Rechnungsdatum) wählen und **Prüfung starten**. Ist die Texterkennung eingerichtet, lässt sich
+   *Seiten ohne Text mit der Texterkennung lesen* anhaken – dann werden auch Seiten ohne Textebene (reine Bild-Scans)
+   per Text verglichen statt nur per Bild; solche Seiten sind mit **OCR** gekennzeichnet. Jede PDF wird einmal aus Paperless geladen und Seite für
    Seite untersucht; der Fortschritt wird angezeigt. Höchstens `AUDIT_MAX_DOCS` Dokumente je Prüfung (Standard 200, die neuesten zuerst).
 2. Das **Prüfergebnis** zeigt nur Dokumente mit Auffälligkeiten (*auch unauffällige Dokumente anzeigen* blendet alle ein).
    Jede Seite erscheint als **Vorschaubild** mit den darauf erkannten Lieferscheinnummern.
@@ -257,35 +262,51 @@ korrigiert und danach mit *korrigiert* gekennzeichnet – für eine Kontrolle di
 ---
 
 ## KI-Unterstützung
-Optional kann eine KI bei schwer lesbaren Dokumenten helfen. Angebunden wird jede **OpenAI-kompatible API**,
-abgerechnet wird beim Anbieter nach verbrauchten Tokens. Fertig hinterlegt sind **OpenAI** und **Mistral**; über
-`AI_BASE_URL` lässt sich jeder andere kompatible Dienst oder ein lokales Modell (z. B. Ollama) eintragen.
+Optional können zwei KI-Dienste helfen – unabhängig voneinander, einzeln oder kombiniert:
 
-**Einrichten** (in der `docker-compose.yml`):
-```yaml
-      AI_PROVIDER: "mistral"              # oder "openai"
-      AI_API_KEY: "HIER_API_SCHLUESSEL"
-      # AI_MODEL: "mistral-small-latest"  # optional – Standard: mistral-small-latest bzw. gpt-4o-mini
-    volumes:
-      - ./data:/data                      # merkt sich KI-Ergebnisse, spart Tokens
-```
-Danach auf der Startseite **Verbindung testen** klicken.
+| Dienst | Aufgabe | Anbieter | Was gesendet wird |
+|---|---|---|---|
+| 📄 **Texterkennung (OCR)** | liest Dokumente neu, bei denen die Paperless-Texterkennung keine Lieferscheinnummer liefert, und bei der Prüfung Seiten ohne Text | **Mistral OCR** | das **PDF** des betroffenen Dokuments |
+| 🧠 **Auswertung (KI)** | ergänzt fehlende Lieferscheinnummern und prüft unsichere Vorschläge (Nummern, Positionen, Mengen) | **OpenAI**, **Mistral** oder jede andere OpenAI-kompatible API (z. B. lokal mit Ollama) | nur **Text**, gekürzt |
 
-**Was die KI macht** (nur wenn auf der Startseite *KI-Unterstützung nutzen* angehakt ist):
-1. **Fehlende Nummern ergänzen:** Bei Lieferscheinen, in denen keine Nummer erkannt wurde, und bei Rechnungen ohne sicheren
-   Lieferschein liest die KI die Lieferscheinnummern aus dem Text. Diese Nummern sind auf der Prüfseite mit **KI** markiert
-   und werden ganz normal für die Zuordnung verwendet.
-2. **Unsichere Vorschläge prüfen:** Für jeden *unsicheren* Vorschlag (nur Korrespondent + Datum) vergleicht die KI Rechnung und
-   Lieferschein (Nummern, Positionen, Mengen, Datum). Ab 75 % Sicherheit wird der Vorschlag auf *sicher* gesetzt und angehakt,
-   bei „passt nicht“ ab 60 % abgewählt. Die Begründung steht beim Vorschlag (Kennzeichen **🤖 KI**).
+Bewährt hat sich: **Mistral für die Texterkennung, OpenAI für die Auswertung.** Beide werden beim jeweiligen Anbieter
+nach Verbrauch abgerechnet (API-Schlüssel nötig).
 
-Oben auf der Prüfseite steht, wie viele Anfragen gestellt, Nummern ergänzt und Vorschläge geprüft wurden.
+### Einrichten in der Oberfläche
+1. In der Kopfzeile **⚙ Einstellungen** öffnen.
+2. **Texterkennung:** Anbieter *Mistral OCR* wählen, API-Schlüssel eintragen.
+3. **Auswertung:** Anbieter wählen (*OpenAI*, *Mistral* oder *eigene Adresse*), Schlüssel eintragen. Das Modell kann leer
+   bleiben – dann gilt `gpt-4o-mini` (OpenAI) bzw. `mistral-small-latest` (Mistral).
+4. Mit **Speichern & … testen** wird jeder Zugang sofort geprüft; der Status zeigt *aktiv* oder *aus*.
 
-**Kosten und Datenschutz**
-- Die KI wird nur dort gefragt, wo die normale Erkennung nicht weiterkommt – höchstens `AI_MAX_CALLS` Anfragen je Durchlauf (Standard 30).
-- An die KI geht nur der **OCR-Text** der betroffenen Dokumente, gekürzt auf `AI_MAX_CHARS` Zeichen (Standard 6000) – keine PDFs, keine Bilder.
-- Ergebnisse werden in `/data/ki-cache.json` gespeichert; dasselbe Dokument wird nicht erneut abgefragt.
-- Wer keine Daten nach außen geben möchte, trägt über `AI_BASE_URL` ein lokales Modell ein.
+Hinweise:
+- Schlüssel werden nie vollständig angezeigt (nur die letzten 4 Zeichen). Ein leeres Schlüsselfeld lässt den gespeicherten
+  Schlüssel unverändert; *gespeicherten Schlüssel löschen* entfernt ihn.
+- Wird für beide Dienste Mistral verwendet, reicht **ein** Schlüssel – er wird automatisch mitgenutzt.
+- Je Dienst lässt sich eine **Höchstzahl je Durchlauf** festlegen (Standard: 20 Dokumente Texterkennung, 30 Anfragen Auswertung).
+- Gespeichert wird in `/data/einstellungen.json` (nur für den Container lesbar). Dafür muss das Volume `./data:/data`
+  eingebunden sein – sonst zeigt die Einstellungsseite einen Hinweis.
+- Da hier Zugangsdaten hinterlegt sind, empfiehlt sich ein Login über `APP_USER` / `APP_PASSWORD` oder ein Reverse-Proxy mit Anmeldung.
+- Die bisherigen Umgebungsvariablen (`AI_…`, `OCR_…`) funktionieren weiter und dienen als **Vorbelegung**, solange in der
+  Oberfläche nichts gespeichert wurde.
+
+### Was beim Durchlauf passiert
+Ist auf der Startseite *KI-Unterstützung nutzen* angehakt:
+1. **Texterkennung** (wenn eingerichtet): Lieferscheine ohne erkannte Nummer und Rechnungen ohne sicheren Lieferschein werden
+   per Mistral OCR neu gelesen; im neuen Text sucht die normale Nummernerkennung. So gefundene Nummern sind mit **OCR** markiert.
+2. **Auswertung – Nummern** (wenn eingerichtet): Findet auch das nichts, liest die KI die Lieferscheinnummern aus dem Text
+   (Kennzeichen **KI**). Sie bekommt dabei den Paperless-Text **und** den OCR-Text.
+3. **Auswertung – Vorschläge:** Jeden *unsicheren* Vorschlag vergleicht die KI inhaltlich. Ab 75 % Sicherheit wird er auf
+   *sicher* gesetzt und angehakt, bei „passt nicht“ ab 60 % abgewählt; die Begründung steht beim Vorschlag (**🤖 KI**).
+
+Oben auf der Prüfseite steht, wie viele Dokumente neu erkannt, Nummern ergänzt und Vorschläge geprüft wurden.
+
+### Kosten und Datenschutz
+- Beide Dienste werden nur dort gefragt, wo die normale Erkennung nicht weiterkommt, und sind je Durchlauf begrenzt.
+- Die **Texterkennung** sendet das PDF des betroffenen Dokuments, die **Auswertung** nur Text (gekürzt auf `AI_MAX_CHARS`, Standard 6000 Zeichen).
+- Ergebnisse beider Dienste werden in `/data/ki-cache.json` gespeichert – dasselbe Dokument wird nicht erneut abgerechnet.
+- Wer keine Daten nach außen geben möchte, lässt die Texterkennung aus und trägt für die Auswertung ein lokales Modell ein
+  (*eigene Adresse*, z. B. `http://192.168.1.60:11434/v1`).
 
 ## Was mit den Originalen passiert
 | | Originale in den Papierkorb (Standard) | Originale behalten |
@@ -376,15 +397,27 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `SEARCH_UNLIMITED` | `false` | Suche zu Lieferscheinen: standardmäßig ohne Zeitbegrenzung |
 | `SEARCH_SAME_CORR` | `true` | Suche zu Lieferscheinen: standardmäßig nur beim gleichen Korrespondenten |
 | `AUDIT_MAX_DOCS` | `200` | Prüfung: höchstens so viele Dokumente je Prüfung |
-| `AI_PROVIDER` | `openai` | KI-Anbieter: `openai` oder `mistral` (setzt Adresse und Standardmodell) |
-| `AI_API_KEY` | leer | API-Schlüssel des Anbieters – ohne Schlüssel ist die KI aus |
+| `DATA_DIR` | `/data` | Datenverzeichnis für Einstellungen und Zwischenspeicher (als Volume einbinden) |
+
+Die folgenden KI-Variablen sind **optional** – die Zugänge werden normalerweise unter **⚙ Einstellungen** gepflegt.
+Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorrang.
+
+| Variable | Standard | Bedeutung |
+|---|---|---|
+| `OCR_PROVIDER` | – | `mistral` schaltet die Texterkennung ein |
+| `OCR_API_KEY` | leer | Schlüssel für die Texterkennung |
+| `OCR_MODEL` | `mistral-ocr-latest` | Modell der Texterkennung |
+| `OCR_MAX_CALLS` | `20` | höchstens so viele Dokumente je Durchlauf per Texterkennung |
+| `AI_PROVIDER` | `openai` | Auswertung: `openai` oder `mistral` (setzt Adresse und Standardmodell) |
+| `AI_API_KEY` | leer | Schlüssel für die Auswertung – ohne Schlüssel ist die Auswertung aus |
 | `AI_MODEL` | je Anbieter | Modellname, Standard `gpt-4o-mini` (OpenAI) bzw. `mistral-small-latest` (Mistral) |
 | `AI_BASE_URL` | je Anbieter | eigene Adresse einer OpenAI-kompatiblen API, z. B. `http://192.168.1.60:11434/v1` für Ollama |
 | `AI_ENABLED` | – | `true` schaltet die KI auch ohne Schlüssel ein (für lokale Modelle) |
 | `AI_MAX_CALLS` | `30` | höchstens so viele KI-Anfragen je Durchlauf |
 | `AI_MAX_CHARS` | `6000` | so viele Zeichen Text je Dokument gehen an die KI |
 | `AI_TIMEOUT` | `60` | Zeitlimit je KI-Anfrage in Sekunden |
-| `AI_CACHE_FILE` | `/data/ki-cache.json` | Zwischenspeicher für KI-Ergebnisse |
+| `AI_CACHE_FILE` | `/data/ki-cache.json` | Zwischenspeicher für Ergebnisse von Texterkennung und Auswertung |
+| `SETTINGS_FILE` | `/data/einstellungen.json` | Datei, in der die Einstellungen aus der Oberfläche gespeichert werden |
 | `AUTO_CLEAN_TITLES` | `true` | „(merged)“ nach dem Zusammenführen automatisch aus den Titeln entfernen |
 | `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche (beide setzen) |
 | `TZ` | – | Zeitzone, z. B. `Europe/Berlin` |
@@ -401,15 +434,24 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | Neue Dokumente erscheinen nicht | Paperless verarbeitet im Hintergrund – kurz warten. Bei Problemen in Paperless unter *Dateiaufgaben* nachsehen. |
 | Lieferscheine werden nicht gefunden | Prüfen, ob die Nummer im OCR-Text (Paperless → Dokument → *Inhalt*) hinter einem der oben genannten Begriffe steht. Bessere Erkennung: mit 300 dpi scannen, `PAPERLESS_OCR_LANGUAGE: deu` setzen, Dokument in Paperless *erneut verarbeiten*. |
 | Vorschlag „abgelaufen“ | Vorschläge gelten eine Stunde und nur für einen Lauf – einfach neu suchen. |
-| *Verbindung zur KI fehlgeschlagen* – HTTP 401 | API-Schlüssel falsch oder nicht freigeschaltet. |
-| *Verbindung zur KI fehlgeschlagen* – HTTP 404 / Modell unbekannt | `AI_MODEL` prüfen – der Name muss genau so beim Anbieter existieren. |
-| *Höchstzahl an KI-Anfragen erreicht* | `AI_MAX_CALLS` erhöhen oder den Zeitraum verkleinern. |
+| *… fehlgeschlagen* – HTTP 401 (Einstellungen) | API-Schlüssel falsch oder beim Anbieter nicht freigeschaltet. |
+| *Speichern nicht möglich* / *Verzeichnis nicht beschreibbar* | Volume `./data:/data` in der `docker-compose.yml` einbinden und Container neu starten. |
+| *… fehlgeschlagen* – HTTP 404 / Modell unbekannt | Modellname unter ⚙ Einstellungen prüfen – er muss genau so beim Anbieter existieren. |
+| *Höchstzahl an Anfragen erreicht* | Höchstzahl unter ⚙ Einstellungen erhöhen oder den Zeitraum verkleinern. |
 | Prüfung meldet *Konnte nicht geprüft werden* | Die PDF des Dokuments ließ sich nicht laden oder lesen – Dokument in Paperless öffnen und ggf. *erneut verarbeiten*. |
 | Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
 
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.10 (05.11.2026)
+- neue Seite **⚙ Einstellungen**: KI-Zugänge direkt in der Oberfläche einrichten, mit Statusanzeige und Test-Knopf je Dienst; Schlüssel werden maskiert angezeigt
+- KI aufgeteilt in **Texterkennung** (Mistral OCR) und **Auswertung** (OpenAI, Mistral oder eigene Adresse) – getrennt oder kombiniert nutzbar, z. B. Mistral für die Texterkennung und OpenAI für die Auswertung
+- Texterkennung liest Lieferscheine ohne erkannte Nummer und schwache Rechnungen neu; gefundene Nummern sind mit **OCR** markiert
+- Prüfung zusammengeführter Rechnungen kann Seiten ohne Text per Texterkennung lesen
+- ein Mistral-Schlüssel genügt, wenn beide Dienste Mistral nutzen
+- Umgebungsvariablen bleiben als Vorbelegung erhalten
 
 ### Version 0.9 (05.11.2026)
 - neue Funktion **Zusammengeführte Rechnungen prüfen** (Taste 🔎 Prüfen): erkennt doppelt enthaltene Seiten per Text- und Bildvergleich, dieselbe Lieferscheinnummer mehrfach im Dokument und in mehreren Rechnungen; Seitenvorschau aller Seiten

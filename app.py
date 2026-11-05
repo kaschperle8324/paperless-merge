@@ -44,20 +44,18 @@ VERIFY_SSL = os.environ.get("VERIFY_SSL", "true").lower() not in ("0", "false", 
 APP_USER = os.environ.get("APP_USER")
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 AUTO_CLEAN_TITLES = os.environ.get("AUTO_CLEAN_TITLES", "true").lower() not in ("0", "false", "no")
-# KI-Anbindung über eine OpenAI-kompatible API (token-basiert abgerechnet)
+# KI-Anbindung: Texterkennung (OCR) und Auswertung, einstellbar in der Oberfläche (Seite "Einstellungen").
+# Die Umgebungsvariablen gelten als Vorbelegung, solange in der Oberfläche nichts gespeichert wurde.
 AI_PROVIDERS = {  # Anbieter mit OpenAI-kompatibler API: (Adresse, Standardmodell)
     "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
     "mistral": ("https://api.mistral.ai/v1", "mistral-small-latest"),
 }
-AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai").strip().lower()
-AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()
-AI_BASE_URL = (os.environ.get("AI_BASE_URL") or AI_PROVIDERS.get(AI_PROVIDER, AI_PROVIDERS["openai"])[0]).rstrip("/")
-AI_MODEL = (os.environ.get("AI_MODEL") or AI_PROVIDERS.get(AI_PROVIDER, ("", ""))[1]).strip()
-AI_ENABLED = bool(AI_MODEL) and (bool(AI_API_KEY) or os.environ.get("AI_ENABLED", "").lower() in ("1", "true", "yes"))
-AI_MAX_CALLS = int(os.environ.get("AI_MAX_CALLS", "30"))      # Höchstzahl KI-Anfragen pro Durchlauf
+OCR_PROVIDERS = {"mistral": ("https://api.mistral.ai/v1/ocr", "mistral-ocr-latest")}
+DATA_DIR = os.environ.get("DATA_DIR", "/data")
+SETTINGS_FILE = os.environ.get("SETTINGS_FILE", os.path.join(DATA_DIR, "einstellungen.json"))
 AI_MAX_CHARS = int(os.environ.get("AI_MAX_CHARS", "6000"))    # Textlänge je Dokument, die an die KI geht
 AI_TIMEOUT = int(os.environ.get("AI_TIMEOUT", "60"))
-AI_CACHE_FILE = os.environ.get("AI_CACHE_FILE", "/data/ki-cache.json")
+AI_CACHE_FILE = os.environ.get("AI_CACHE_FILE", os.path.join(DATA_DIR, "ki-cache.json"))
 AUDIT_MAX_DOCS = int(os.environ.get("AUDIT_MAX_DOCS", "200"))
 # Vorgaben für die Suche nach Rechnungen zu nicht zugeordneten Lieferscheinen
 SEARCH_DOCTYPES = [t.strip() for t in os.environ.get("SEARCH_DOCTYPES", TYPE_INVOICE).split(",") if t.strip()]
@@ -358,6 +356,15 @@ def level_of(score):
     return "unsicher"
 
 
+def _src(extra, num):
+    """Quelle einer zusätzlich gefundenen Nummer ("KI", "OCR") oder ""."""
+    if not extra:
+        return ""
+    if isinstance(extra, dict):
+        return extra.get(num, "")
+    return "KI" if num in extra else ""
+
+
 def build_plan(invoices, deliveries, corr, inv_start, hide_merged=True, ls_extra=None, inv_extra=None):
     """Erzeugt Zuordnungsvorschläge. Jeder Lieferschein wird höchstens einer Rechnung zugeordnet."""
     inv_text = {i["id"]: f"{i.get('title', '')}\n{i.get('content', '')}".upper() for i in invoices}
@@ -458,18 +465,18 @@ def build_plan(invoices, deliveries, corr, inv_start, hide_merged=True, ls_extra
             items.append({**summarize(ls_by_id[ls_id], corr), "score": score, "reason": reason,
                           "level": lvl, "checked": lvl != "unsicher",
                           "nums": [{"n": x, "hit": matched is not None and ocr_norm(x) == ocr_norm(matched),
-                                    "ai": x in ls_extra.get(ls_id, [])} for x in sorted(ls_nums[ls_id])]})
+                                    "ai": _src(ls_extra.get(ls_id), x)} for x in sorted(ls_nums[ls_id])]})
         items.sort(key=lambda x: x["date"])
         hits = {ocr_norm(i["nums"][k]["n"]) for i in items for k in range(len(i["nums"])) if i["nums"][k]["hit"]}
         hits |= {ocr_norm(m[3]) for m in matches.get(inv["id"], []) if m[3]}
         inv_sum = summarize(inv, corr)
-        inv_sum["nums"] = [{"n": x, "hit": ocr_norm(x) in hits, "ai": x in inv_extra.get(inv["id"], [])}
+        inv_sum["nums"] = [{"n": x, "hit": ocr_norm(x) in hits, "ai": _src(inv_extra.get(inv["id"]), x)}
                            for x in inv_found[inv["id"]]]
         entry = {"inv": inv_sum, "items": items,
                  "checked": any(i["checked"] for i in items)}
         (groups if items else without).append(entry)
 
-    unassigned = [{**summarize(d, corr), "nums": [{"n": x, "hit": False, "ai": x in ls_extra.get(d["id"], [])}
+    unassigned = [{**summarize(d, corr), "nums": [{"n": x, "hit": False, "ai": _src(ls_extra.get(d["id"]), x)}
                                                    for x in sorted(ls_nums[d["id"]])]}
                   for d in deliveries if d["id"] not in used_ls]
     return {"groups": groups, "without": without, "unassigned": unassigned,
@@ -477,34 +484,66 @@ def build_plan(invoices, deliveries, corr, inv_start, hide_merged=True, ls_extra
 
 
 def ai_enhance(invoices, deliveries, corr, inv_start, hide_merged, plan):
-    """Verbessert den Plan mit KI: fehlende Nummern ergänzen und unsichere Vorschläge prüfen."""
-    ai = AI()
-    stats = {"extracted": 0, "verified": 0, "upgraded": 0, "rejected": 0}
+    """Verbessert den Plan: OCR (z. B. Mistral) liest schwache Dokumente neu, die KI ergänzt fehlende
+    Lieferscheinnummern und prüft unsichere Vorschläge. Jede Stufe ist einzeln abschaltbar."""
+    ai, ocr = AI(), OCR()
+    use_ai = ai.cfg["enabled"]
+    stats = {"extracted": 0, "ocr_docs": 0, "ocr_nums": 0, "verified": 0, "upgraded": 0, "rejected": 0}
     text = {d["id"]: f"{d.get('title', '')}\n{d.get('content', '')}" for d in invoices + deliveries}
+    pl = Paperless() if ocr.enabled else None
+
+    def better_text(doc_id):
+        """Text über die OCR neu erkennen lassen (nur wenn OCR eingerichtet)."""
+        if not ocr.enabled:
+            return None
+        try:
+            t = ocr.text(pl.download(doc_id))
+        except Exception as e:  # noqa: BLE001
+            ocr.errors.append(f"PDF {doc_id}: {e}")
+            return None
+        if t and t.strip():
+            stats["ocr_docs"] += 1
+            # Paperless-Text behalten und OCR-Text ergänzen – die KI sieht dann beide Fassungen
+            text[doc_id] = f"{text[doc_id][:AI_MAX_CHARS // 2]}\n\n[Texterkennung]\n{t}"
+        return t
+
+    def find_numbers(doc_id, kind, title):
+        """Erst OCR-Text mit der normalen Erkennung, dann die KI. Rückgabe {nummer: quelle}."""
+        found = {}
+        t = better_text(doc_id)
+        if t:
+            nums = delivery_numbers({"content": t, "title": title}) if kind == "ls" else extract_numbers(t)
+            found.update({n: "OCR" for n in nums})
+            stats["ocr_nums"] += len(nums)
+        if not found and use_ai:
+            found.update({n: "KI" for n in ai.extract_numbers(text[doc_id], kind)})
+        return found
 
     # 1. Lieferscheine ohne erkannte Nummer
     ls_extra = {}
     for d in deliveries:
         if not delivery_numbers(d):
-            nums = ai.extract_numbers(text[d["id"]], "ls")
+            nums = find_numbers(d["id"], "ls", d.get("title", ""))
             if nums:
                 ls_extra[d["id"]] = nums
     # 2. Rechnungen ohne sicheren Lieferschein
     inv_extra = {}
     weak = [g["inv"]["id"] for g in plan["without"]] + \
            [g["inv"]["id"] for g in plan["groups"] if all(i["level"] == "unsicher" for i in g["items"])]
+    titles = {i["id"]: i.get("title", "") for i in invoices}
     for inv_id in weak:
-        nums = ai.extract_numbers(text[inv_id], "inv")
+        nums = find_numbers(inv_id, "inv", titles.get(inv_id, ""))
         if nums:
             inv_extra[inv_id] = nums
-    stats["extracted"] = sum(len(v) for v in ls_extra.values()) + sum(len(v) for v in inv_extra.values())
+    stats["extracted"] = sum(1 for v in list(ls_extra.values()) + list(inv_extra.values())
+                             for src in v.values() if src == "KI")
     if ls_extra or inv_extra:
         plan = build_plan(invoices, deliveries, corr, inv_start, hide_merged, ls_extra, inv_extra)
 
     # 3. unsichere Vorschläge prüfen lassen
     for g in plan["groups"]:
         for i in g["items"]:
-            if i["level"] != "unsicher":
+            if i["level"] != "unsicher" or not use_ai:
                 continue
             v = ai.verify_pair(text[g["inv"]["id"]], text[i["id"]])
             if not v:
@@ -522,9 +561,105 @@ def ai_enhance(invoices, deliveries, corr, inv_start, hide_merged, plan):
                 i.update(ai=True, reason=f"{i['reason']} · KI unsicher ({pct} %): {v['begruendung']}")
         g["checked"] = any(i["checked"] for i in g["items"])
     stats["calls"] = ai.calls
-    stats["budget_hit"] = ai.calls >= ai.budget
-    stats["errors"] = ai.errors[-3:]
+    stats["ocr_calls"] = ocr.calls
+    stats["use_ai"], stats["use_ocr"] = use_ai, ocr.enabled
+    stats["budget_hit"] = (use_ai and ai.calls >= ai.budget) or (ocr.enabled and ocr.calls >= ocr.budget)
+    stats["errors"] = (ocr.errors + ai.errors)[-4:]
     return plan, stats
+
+
+# --------------------------------------------------------------------------- Einstellungen (KI-Zugänge)
+_SETTINGS = {"mtime": None, "data": {}}
+_SETTINGS_LOCK = threading.Lock()
+
+
+def _env_bool(name, default=False):
+    v = os.environ.get(name)
+    return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_defaults():
+    ai_key = os.environ.get("AI_API_KEY", "").strip()
+    ai_prov = os.environ.get("AI_PROVIDER", "openai").strip().lower()
+    if os.environ.get("AI_BASE_URL") and ai_prov not in AI_PROVIDERS:
+        ai_prov = "custom"
+    ai_on = bool(ai_key) or _env_bool("AI_ENABLED")
+    ocr_key = os.environ.get("OCR_API_KEY", "").strip()
+    ocr_on = bool(ocr_key) or os.environ.get("OCR_PROVIDER", "").strip().lower() == "mistral"
+    return {
+        "ai": {"provider": ai_prov if ai_on else "off", "api_key": ai_key,
+               "model": os.environ.get("AI_MODEL", "").strip(), "base_url": os.environ.get("AI_BASE_URL", "").strip(),
+               "max_calls": int(os.environ.get("AI_MAX_CALLS", "30"))},
+        "ocr": {"provider": "mistral" if ocr_on else "off", "api_key": ocr_key,
+                "model": os.environ.get("OCR_MODEL", "").strip(), "max_calls": int(os.environ.get("OCR_MAX_CALLS", "20"))},
+    }
+
+
+def load_settings():
+    """Umgebungsvariablen als Vorbelegung, darüber die in der Oberfläche gespeicherten Werte."""
+    with _SETTINGS_LOCK:
+        try:
+            mtime = os.path.getmtime(SETTINGS_FILE)
+        except OSError:
+            mtime = None
+        if mtime != _SETTINGS["mtime"]:
+            data = {}
+            if mtime is not None:
+                try:
+                    with open(SETTINGS_FILE, encoding="utf-8") as f:
+                        data = json.load(f)
+                except (OSError, ValueError):
+                    data = {}
+            _SETTINGS.update(mtime=mtime, data=data)
+        stored = _SETTINGS["data"]
+    merged = _env_defaults()
+    for sec in ("ai", "ocr"):
+        merged[sec].update({k: v for k, v in (stored.get(sec) or {}).items() if k in merged[sec]})
+    return merged
+
+
+def save_settings(settings):
+    os.makedirs(os.path.dirname(SETTINGS_FILE) or ".", exist_ok=True)
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, SETTINGS_FILE)
+    with _SETTINGS_LOCK:
+        _SETTINGS["mtime"] = None
+
+
+def ai_cfg(settings=None):
+    st = settings or load_settings()
+    a, o = st["ai"], st["ocr"]
+    prov = a.get("provider") or "off"
+    if prov == "off":
+        return {"enabled": False, "provider": "off", "model": "", "base_url": "", "key": "", "max_calls": 0}
+    base = (a.get("base_url") or "").rstrip("/") or AI_PROVIDERS.get(prov, ("", ""))[0]
+    model = a.get("model") or AI_PROVIDERS.get(prov, ("", ""))[1]
+    key = a.get("api_key") or (o.get("api_key") if prov == "mistral" and o.get("provider") == "mistral" else "")
+    enabled = bool(base and model and (key or prov == "custom"))
+    return {"enabled": enabled, "provider": prov, "model": model, "base_url": base, "key": key,
+            "max_calls": int(a.get("max_calls") or 30)}
+
+
+def ocr_cfg(settings=None):
+    st = settings or load_settings()
+    a, o = st["ai"], st["ocr"]
+    prov = o.get("provider") or "off"
+    if prov not in OCR_PROVIDERS:
+        return {"enabled": False, "provider": "off", "model": "", "url": "", "key": "", "max_calls": 0}
+    url, default_model = OCR_PROVIDERS[prov]
+    key = o.get("api_key") or (a.get("api_key") if a.get("provider") == "mistral" else "")
+    return {"enabled": bool(key), "provider": prov, "model": o.get("model") or default_model, "url": url, "key": key,
+            "max_calls": int(o.get("max_calls") or 20)}
+
+
+def mask_key(key):
+    return f"••••{key[-4:]}" if key and len(key) > 8 else ("••••" if key else "")
 
 
 # --------------------------------------------------------------------------- KI
@@ -537,8 +672,9 @@ class AI:
     _cache = None
     _lock = threading.Lock()
 
-    def __init__(self, budget=AI_MAX_CALLS):
-        self.budget = budget
+    def __init__(self, budget=None):
+        self.cfg = ai_cfg()
+        self.budget = self.cfg["max_calls"] if budget is None else budget
         self.calls = 0
         self.errors = []
 
@@ -571,16 +707,17 @@ class AI:
                 hit = self._load_cache().get(cache_key)
             if hit is not None:
                 return hit
-        if self.calls >= self.budget:
+        if not self.cfg["enabled"] or self.calls >= self.budget:
             return None
         self.calls += 1
         headers = {"Content-Type": "application/json"}
-        if AI_API_KEY:
-            headers["Authorization"] = f"Bearer {AI_API_KEY}"
-        body = {"model": AI_MODEL, "temperature": 0,
+        if self.cfg["key"]:
+            headers["Authorization"] = f"Bearer {self.cfg['key']}"
+        body = {"model": self.cfg["model"], "temperature": 0,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
         try:
-            r = requests.post(f"{AI_BASE_URL}/chat/completions", json=body, headers=headers, timeout=AI_TIMEOUT)
+            r = requests.post(f"{self.cfg['base_url']}/chat/completions", json=body, headers=headers,
+                              timeout=AI_TIMEOUT)
             if r.status_code >= 400:
                 raise AIError(f"HTTP {r.status_code}: {r.text[:200]}")
             text = r.json()["choices"][0]["message"]["content"] or ""
@@ -597,9 +734,8 @@ class AI:
                 self._save_cache()
         return result
 
-    @staticmethod
-    def _key(kind, *texts):
-        h = hashlib.sha256(("\x00".join([AI_MODEL, kind, *texts])).encode("utf-8")).hexdigest()
+    def _key(self, kind, *texts):
+        h = hashlib.sha256(("\x00".join([self.cfg["model"], kind, *texts])).encode("utf-8")).hexdigest()
         return f"{kind}:{h[:32]}"
 
     def extract_numbers(self, text, kind):
@@ -644,6 +780,66 @@ class AI:
 
     def test(self):
         res = self.chat_json("Antworte ausschließlich mit JSON.", 'Gib {"ok": true} zurück.')
+        if res is None:
+            raise AIError(self.errors[-1] if self.errors else "keine Antwort")
+        return res
+
+
+class OCR:
+    """Texterkennung über Mistral OCR. Liefert den Text je Seite; Ergebnisse werden zwischengespeichert."""
+
+    def __init__(self, budget=None):
+        self.cfg = ocr_cfg()
+        self.budget = self.cfg["max_calls"] if budget is None else budget
+        self.calls = 0
+        self.errors = []
+
+    @property
+    def enabled(self):
+        return self.cfg["enabled"]
+
+    def pages(self, pdf_bytes):
+        if not self.cfg["enabled"] or not pdf_bytes:
+            return None
+        key = "ocr:" + hashlib.sha256(self.cfg["model"].encode() + pdf_bytes).hexdigest()[:40]
+        with AI._lock:
+            hit = AI._load_cache().get(key)
+        if hit is not None:
+            return hit
+        if self.calls >= self.budget:
+            return None
+        self.calls += 1
+        import base64
+        body = {"model": self.cfg["model"], "include_image_base64": False,
+                "document": {"type": "document_url",
+                             "document_url": "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode()}}
+        try:
+            r = requests.post(self.cfg["url"], json=body, timeout=max(AI_TIMEOUT, 120),
+                              headers={"Authorization": f"Bearer {self.cfg['key']}", "Content-Type": "application/json"})
+            if r.status_code >= 400:
+                raise AIError(f"HTTP {r.status_code}: {r.text[:200]}")
+            pages = sorted(r.json().get("pages", []), key=lambda p: p.get("index", 0))
+            result = [str(p.get("markdown") or "")[:8000] for p in pages]
+        except (requests.RequestException, AIError, ValueError) as e:
+            self.errors.append(f"OCR: {e}")
+            return None
+        with AI._lock:
+            AI._load_cache()[key] = result
+            AI._save_cache()
+        return result
+
+    def text(self, pdf_bytes):
+        p = self.pages(pdf_bytes)
+        return None if p is None else "\n\n".join(p)
+
+    def test(self):
+        import pypdf
+        w = pypdf.PdfWriter()
+        w.add_blank_page(width=200, height=200)
+        w.add_metadata({"/Title": uuid.uuid4().hex})  # eindeutig, damit nicht aus dem Cache
+        buf = io.BytesIO()
+        w.write(buf)
+        res = self.pages(buf.getvalue())
         if res is None:
             raise AIError(self.errors[-1] if self.errors else "keine Antwort")
         return res
@@ -732,7 +928,7 @@ def _is_ls_page(page):
 AUDIT_JOBS = {}
 
 
-def _run_audit(job_id, start, end):
+def _run_audit(job_id, start, end, use_ocr=False):
     job = AUDIT_JOBS[job_id]
     try:
         pl = Paperless()
@@ -745,6 +941,8 @@ def _run_audit(job_id, start, end):
             job["truncated"] = len(docs)
             docs = docs[:AUDIT_MAX_DOCS]
         job["total"] = len(docs)
+        ocr = OCR() if use_ocr else None
+        job["ocr_docs"] = 0
         results = []
         for d in docs:
             entry = {**summarize(d, corr), "pages": [], "dups": {}, "error": None}
@@ -753,7 +951,16 @@ def _run_audit(job_id, start, end):
                 with open(os.path.join(job["dir"], f"{d['id']}.pdf"), "wb") as f:
                     f.write(pdf)
                 pages = analyze_pdf(pdf)
-                entry["pages"] = [{"n": p["n"], "nums": p["nums"], "ls": _is_ls_page(p)} for p in pages]
+                if ocr and any(len(p["text"]) < 40 for p in pages):
+                    ocr_pages = ocr.pages(pdf)
+                    if ocr_pages:
+                        job["ocr_docs"] += 1
+                        for p in pages:
+                            if len(p["text"]) < 40 and p["n"] - 1 < len(ocr_pages):
+                                t = ocr_pages[p["n"] - 1]
+                                p["text"], p["nums"], p["ocr"] = _norm_page_text(t), sorted(extract_numbers(t)), True
+                entry["pages"] = [{"n": p["n"], "nums": p["nums"], "ls": _is_ls_page(p), "ocr": p.get("ocr", False)}
+                                  for p in pages]
                 entry["dups"] = find_duplicate_pages(pages)
                 entry["_pages"] = pages
             except Exception as e:  # noqa: BLE001
@@ -787,6 +994,8 @@ def _run_audit(job_id, start, end):
                     e["repeat"].append({"num": places[0][2], "pages": mine})
             e.pop("_pages", None)
             e["issues"] = len(e["dups"]) + len(e["cross"]) + len(e["repeat"]) + (1 if e["error"] else 0)
+        if ocr:
+            job["ocr_errors"] = ocr.errors[-3:]
         titles = {e["id"]: e["title"] for e in results}
         job["titles"] = titles
         job["results"] = results
@@ -896,7 +1105,7 @@ h3{margin:0 0 12px;font-size:1.05rem;font-weight:650}
 .chip .cnt{font-style:normal;opacity:.6;font-size:.78rem;margin-left:6px}
 .linkbtn{background:none;border:0;box-shadow:none;color:var(--accent);padding:0;font-size:.85rem;font-weight:600;cursor:pointer}
 label.f{display:block;margin:0 0 6px;font-size:.85rem;font-weight:600;color:var(--muted)}
-input[type=date],input[type=number],input[type=search],input[type=text],select{width:100%;padding:10px 12px;font:inherit;color:var(--text);
+input[type=date],input[type=number],input[type=search],input[type=text],input[type=password],select{width:100%;padding:10px 12px;font:inherit;color:var(--text);
   background:var(--surface2);border:1px solid var(--line);border-radius:10px;outline:none}
 input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
 .switch{display:flex;gap:10px;align-items:center;margin-top:14px;cursor:pointer;font-weight:500}
@@ -935,6 +1144,7 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+code{word-break:break-all}
 .pagegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-top:12px}
 .pg{border:2px solid var(--line);border-radius:10px;padding:6px;background:var(--surface2);display:flex;flex-direction:column;gap:4px;cursor:pointer}
 .pg img{width:100%;aspect-ratio:1/1.414;object-fit:cover;border-radius:6px;background:#fff}
@@ -968,6 +1178,7 @@ ul{padding-left:18px}
 <header><a href="{{ url_for('index') }}" class="home"><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></a>
 <nav class="hnav"><a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
 <a class="hbtn" href="{{ url_for('audit') }}">🔎 Prüfen</a>
+<a class="hbtn" href="{{ url_for('settings') }}">⚙ Einstellungen</a>
 {% if paperless_link %}<a class="hbtn" href="{{ paperless_link }}" target="_blank" rel="noopener">Paperless öffnen ↗</a>{% endif %}
 <span class="ver">v{{ version }}</span></nav></header>
 <main>
@@ -997,11 +1208,12 @@ INDEX = """
    <p class="meta">Ohne Haken bleiben die Originale erhalten.</p>
    <label class="switch"><input type="checkbox" name="hide_merged" value="1" checked>
      Bereits ergänzte Rechnungen ausblenden</label>
-   {% if ai_enabled %}<label class="switch"><input type="checkbox" name="use_ai" value="1" checked>
+   {% if ai.enabled or ocr.enabled %}<label class="switch"><input type="checkbox" name="use_ai" value="1" checked>
      🤖 KI-Unterstützung nutzen</label>
-   <p class="meta">Modell <code>{{ ai_model }}</code> · ergänzt fehlende Lieferscheinnummern und prüft unsichere Vorschläge
-     (höchstens {{ ai_max }} Anfragen je Durchlauf) · <a href="{{ url_for('ki_test') }}">Verbindung testen</a></p>
-   {% else %}<p class="meta">🤖 KI-Unterstützung ist nicht eingerichtet (siehe Anleitung, Abschnitt KI).</p>{% endif %}
+   <p class="meta">{% if ocr.enabled %}Texterkennung: <code>{{ ocr.model }}</code>{% endif %}
+     {% if ocr.enabled and ai.enabled %} · {% endif %}{% if ai.enabled %}Auswertung: <code>{{ ai.model }}</code>{% endif %}
+     · <a href="{{ url_for('settings') }}">Einstellungen</a></p>
+   {% else %}<p class="meta">🤖 KI-Unterstützung ist nicht eingerichtet – <a href="{{ url_for('settings') }}">jetzt einrichten</a>.</p>{% endif %}
    <p class="meta">Verwendete Lieferscheine bekommen das Tag „{{ done_tag }}“, die Rechnungen das Tag „{{ merged_tag }}“.
      Beide werden beim nächsten Lauf nicht mehr angeboten – auch ältere zusammengeführte Rechnungen werden erkannt.</p>
   </section>
@@ -1054,10 +1266,12 @@ PREVIEW = """
 <form method="post" action="{{ url_for('execute') }}" id="f">
 <input type="hidden" name="plan" value="{{ plan_id }}">
 {% if info %}<div class="card ok">{{ info }}</div>{% endif %}
-{% if ai_stats %}<div class="card {{ 'err' if ai_stats.errors and not ai_stats.calls }}">🤖 <b>KI-Unterstützung:</b>
-  {{ ai_stats.calls }} Anfrage(n) · {{ ai_stats.extracted }} Nummer(n) ergänzt · {{ ai_stats.verified }} unsichere Vorschläge geprüft
-  ({{ ai_stats.upgraded }} bestätigt, {{ ai_stats.rejected }} verworfen)
-  {% if ai_stats.budget_hit %}<br><span class="meta">Höchstzahl an KI-Anfragen erreicht (AI_MAX_CALLS) – nicht alles wurde geprüft.</span>{% endif %}
+{% if ai_stats %}<div class="card {{ 'err' if ai_stats.errors and not ai_stats.calls and not ai_stats.ocr_calls }}">🤖 <b>KI-Unterstützung:</b>
+  {% if ai_stats.use_ocr %}OCR: {{ ai_stats.ocr_docs }} Dokument(e) neu erkannt, {{ ai_stats.ocr_nums }} Nummer(n) gefunden ({{ ai_stats.ocr_calls }} Anfrage(n)){% endif %}
+  {% if ai_stats.use_ocr and ai_stats.use_ai %} · {% endif %}
+  {% if ai_stats.use_ai %}Auswertung: {{ ai_stats.calls }} Anfrage(n) · {{ ai_stats.extracted }} Nummer(n) ergänzt · {{ ai_stats.verified }} unsichere Vorschläge geprüft
+  ({{ ai_stats.upgraded }} bestätigt, {{ ai_stats.rejected }} verworfen){% endif %}
+  {% if ai_stats.budget_hit %}<br><span class="meta">Höchstzahl an Anfragen erreicht (siehe Einstellungen) – nicht alles wurde geprüft.</span>{% endif %}
   {% for e in ai_stats.errors %}<br><span class="meta" style="color:var(--bad)">Fehler: {{ e }}</span>{% endfor %}</div>{% endif %}
 <div class="card"><h3>2 · Zuordnungen prüfen</h3>
   <div class="meta">Zeitraum {{ start.strftime('%d.%m.%Y') }} – {{ end.strftime('%d.%m.%Y') }}</div>
@@ -1088,7 +1302,7 @@ PREVIEW = """
       <span class="meta">{{ g.inv.date|de }} · {{ g.inv.correspondent }}{% if g.inv.asn %} · ASN {{ g.inv.asn }}{% endif %} ·
       <a href="{{ link(g.inv.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span>
       <div class="nums"><span class="nl">Lieferschein-Nr. in der Rechnung:</span>
-        {% for x in g.inv.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}{% if x.ai %}<span class="ai">KI</span>{% endif %}</span>{% else %}<span class="none">keine gefunden</span>{% endfor %}</div></div>
+        {% for x in g.inv.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}{% if x.ai %}<span class="ai">{{ x.ai }}</span>{% endif %}</span>{% else %}<span class="none">keine gefunden</span>{% endfor %}</div></div>
   </div>
   {% if g['items'] %}<div class="items">{% endif %}
   {% for i in g['items'] %}
@@ -1098,7 +1312,7 @@ PREVIEW = """
     <div><span class="badge {{ i.level }}">{{ i.level }}</span>{% if i.ai %}<span class="ai">🤖 KI</span>{% endif %} <b>{{ i.title }}</b><br>
       <span class="meta">{{ i.date|de }} · {{ i.correspondent }} · {{ i.reason }}</span>
       <div class="nums"><span class="nl">Erkannte Nr.:</span>
-        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}{% if x.ai %}<span class="ai">KI</span>{% endif %}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}
+        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}{% if x.ai %}<span class="ai">{{ x.ai }}</span>{% endif %}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}
         {% if i.level == 'unsicher' %}<button type="submit" class="linkbtn" formaction="{{ url_for('search_ls') }}"
           name="find_ls" value="{{ i.id }}" data-search1>🔍 Rechnung in Paperless suchen</button>{% endif %}</div></div>
   </div>
@@ -1277,6 +1491,9 @@ AUDIT_FORM = """
     <div><label class="f">Rechnungsdatum bis</label><input type="date" name="end" value="{{ end }}" required></div>
   </div>
   <p class="meta">Es werden höchstens {{ max_docs }} Dokumente geprüft (die neuesten zuerst). Jede PDF wird dafür einmal geladen.</p>
+  {% if ocr_enabled %}<label class="switch"><input type="checkbox" name="use_ocr" value="1" checked>
+    📄 Seiten ohne Text mit der Texterkennung ({{ ocr_model }}) lesen</label>
+  <p class="meta">Nur Dokumente mit Seiten ohne Textebene werden gesendet – höchstens so viele wie in den Einstellungen festgelegt.</p>{% endif %}
   <div style="margin-top:16px"><button>Prüfung starten</button></div>
 </form>
 """
@@ -1300,6 +1517,8 @@ AUDIT_RESULT = """
     <div class="stat"><b>{{ flagged|length }}</b><span class="meta">mit Auffälligkeiten</span></div>
     <div class="stat"><b>{{ dup_total }}</b><span class="meta">doppelte Seiten</span></div>
   </div>
+  {% if job.ocr_docs %}<p class="meta">📄 {{ job.ocr_docs }} Dokument(e) mit Seiten ohne Text wurden per Texterkennung gelesen.</p>{% endif %}
+  {% for e in job.ocr_errors or [] %}<p class="meta" style="color:var(--bad)">{{ e }}</p>{% endfor %}
   {% if job.truncated %}<p class="meta">Achtung: {{ job.truncated }} Dokumente gefunden, geprüft wurden die neuesten {{ job.results|length }}.
     Für den Rest den Zeitraum verkleinern.</p>{% endif %}
   <p class="meta"><span class="badge unsicher">sicher doppelt</span> Seite ist (fast) identisch mit einer früheren Seite – zum Löschen vorausgewählt ·
@@ -1329,7 +1548,7 @@ AUDIT_RESULT = """
   {% for p in e.pages %}{% set d = e.dups.get(p.n) %}
     <label class="pg {{ 'dup' if d and d[1] == 'sicher' else ('maybe' if d else '') }}">
       <img loading="lazy" src="{{ url_for('audit_page', job_id=job_id, doc_id=e.id, n=p.n) }}">
-      <div class="pgl"><b>S. {{ p.n }}</b>{% if p.nums %} · {{ p.nums|join(', ') }}{% endif %}</div>
+      <div class="pgl"><b>S. {{ p.n }}</b>{% if p.nums %} · {{ p.nums|join(', ') }}{% endif %}{% if p.ocr %}<span class="ai">OCR</span>{% endif %}</div>
       {% if d %}<div class="pgd">{{ d[2] }}</div>{% endif %}
       {% if p.n > 1 %}<span class="pgc"><input type="checkbox" name="del_{{ e.id }}" value="{{ p.n }}" class="delp"
         {{ 'checked' if d and d[1] == 'sicher' and e.id not in fixed }}> löschen</span>{% endif %}
@@ -1350,6 +1569,71 @@ document.getElementById('af').addEventListener('submit', e => {
   const n = document.querySelectorAll('.delp:checked').length;
   if (!n) { alert('Keine Seite markiert.'); e.preventDefault(); return; }
   if (!confirm(n + ' Seite(n) aus den Dokumenten entfernen? Paperless legt dafür neue Versionen an.')) e.preventDefault();
+});
+</script>
+"""
+
+SETTINGS = """
+{% for m in msgs %}<div class="card {{ m[0] }}">{{ m[1] }}</div>{% endfor %}
+<form class="card" method="post" action="{{ url_for('settings') }}" autocomplete="off">
+ <h3>⚙ Einstellungen – KI-Zugänge</h3>
+ <p class="meta" style="margin-top:0">Texterkennung und Auswertung lassen sich getrennt einrichten – z. B. Mistral für die
+   Texterkennung und OpenAI für die Auswertung. Beide sind optional. Die Zugänge werden auf dem Server in
+   <code>{{ settings_file }}</code> gespeichert{% if not writable %} – <b style="color:var(--bad)">das Verzeichnis ist nicht beschreibbar,
+   bitte in der docker-compose.yml das Volume <code>./data:/data</code> einbinden</b>{% endif %}.
+   {% if not protected %}<br><b>Tipp:</b> Mit <code>APP_USER</code> / <code>APP_PASSWORD</code> lässt sich die Oberfläche mit einem Login schützen.{% endif %}</p>
+ <div class="cols">
+  <section>
+   <h3>📄 Texterkennung (OCR)</h3>
+   <p class="meta" style="margin-top:0">Liest Dokumente neu, bei denen die Texterkennung von Paperless keine Lieferscheinnummer liefert,
+     und Seiten ohne Text bei der Prüfung. Das PDF des betroffenen Dokuments wird dafür an den Anbieter gesendet.</p>
+   <label class="f">Anbieter</label>
+   <select name="ocr_provider">
+     <option value="off" {{ 'selected' if st.ocr.provider == 'off' }}>aus</option>
+     <option value="mistral" {{ 'selected' if st.ocr.provider == 'mistral' }}>Mistral OCR</option></select>
+   <label class="f" style="margin-top:12px">API-Schlüssel</label>
+   <input type="password" name="ocr_api_key" value="" placeholder="{{ ('gespeichert ' ~ mask(st.ocr.api_key)) if st.ocr.api_key else 'Schlüssel eingeben' }}">
+   {% if st.ocr.api_key %}<label class="switch"><input type="checkbox" name="ocr_clear" value="1"> gespeicherten Schlüssel löschen</label>{% endif %}
+   <p class="meta">Leer lassen = Schlüssel bleibt unverändert. Ist für die Auswertung ebenfalls Mistral gewählt, wird dieser Schlüssel dort mitgenutzt.</p>
+   <div class="grid2">
+     <div><label class="f">Modell</label><input type="text" name="ocr_model" value="{{ st.ocr.model }}" placeholder="{{ ocr_default }}"></div>
+     <div><label class="f">Höchstzahl Dokumente je Durchlauf</label><input type="number" name="ocr_max_calls" value="{{ st.ocr.max_calls }}" min="1" max="500"></div>
+   </div>
+   <p class="meta">Status: {% if ocr.enabled %}<span class="badge sicher">aktiv</span> {{ ocr.model }}{% else %}<span class="badge unsicher">aus</span>{% endif %}</p>
+   <button type="submit" class="sec" name="action" value="test_ocr">Speichern &amp; Texterkennung testen</button>
+  </section>
+  <section>
+   <h3>🧠 Auswertung (KI)</h3>
+   <p class="meta" style="margin-top:0">Ergänzt fehlende Lieferscheinnummern und prüft unsichere Vorschläge anhand des Textes
+     (Nummern, Positionen, Mengen). Es wird nur Text gesendet, keine PDFs.</p>
+   <label class="f">Anbieter</label>
+   <select name="ai_provider" id="aiprov">
+     <option value="off" {{ 'selected' if st.ai.provider == 'off' }}>aus</option>
+     <option value="openai" {{ 'selected' if st.ai.provider == 'openai' }}>OpenAI</option>
+     <option value="mistral" {{ 'selected' if st.ai.provider == 'mistral' }}>Mistral</option>
+     <option value="custom" {{ 'selected' if st.ai.provider == 'custom' }}>eigene Adresse (OpenAI-kompatibel, z. B. Ollama)</option></select>
+   <div id="aibase" {{ '' if st.ai.provider == 'custom' else 'hidden' }}>
+     <label class="f" style="margin-top:12px">Adresse der API</label>
+     <input type="text" name="ai_base_url" value="{{ st.ai.base_url }}" placeholder="http://192.168.1.60:11434/v1"></div>
+   <label class="f" style="margin-top:12px">API-Schlüssel</label>
+   <input type="password" name="ai_api_key" value="" placeholder="{{ ('gespeichert ' ~ mask(st.ai.api_key)) if st.ai.api_key else 'Schlüssel eingeben' }}">
+   {% if st.ai.api_key %}<label class="switch"><input type="checkbox" name="ai_clear" value="1"> gespeicherten Schlüssel löschen</label>{% endif %}
+   <p class="meta">Leer lassen = Schlüssel bleibt unverändert.</p>
+   <div class="grid2">
+     <div><label class="f">Modell</label><input type="text" name="ai_model" value="{{ st.ai.model }}" placeholder="{{ ai_defaults.get(st.ai.provider, '') }}" id="aimodel"></div>
+     <div><label class="f">Höchstzahl Anfragen je Durchlauf</label><input type="number" name="ai_max_calls" value="{{ st.ai.max_calls }}" min="1" max="1000"></div>
+   </div>
+   <p class="meta">Status: {% if ai.enabled %}<span class="badge sicher">aktiv</span> {{ ai.model }} · {{ ai.base_url }}{% else %}<span class="badge unsicher">aus</span>{% endif %}</p>
+   <button type="submit" class="sec" name="action" value="test_ai">Speichern &amp; Auswertung testen</button>
+  </section>
+ </div>
+ <div style="margin-top:22px"><button type="submit" name="action" value="save">Speichern</button></div>
+</form>
+<script>
+const defaults = {{ ai_defaults|tojson }};
+document.getElementById('aiprov').addEventListener('change', e => {
+  document.getElementById('aibase').hidden = e.target.value !== 'custom';
+  document.getElementById('aimodel').placeholder = defaults[e.target.value] || '';
 });
 </script>
 """
@@ -1415,7 +1699,7 @@ def index(error=None):
         error = error or f"Tags/Korrespondenten konnten nicht geladen werden: {e}"
     return page(INDEX, error=error, start=first_prev.isoformat(), end=today.isoformat(),
                 lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, merged_tag=MERGED_TAG, tags=tags, corrs=corrs,
-                ai_enabled=AI_ENABLED, ai_model=AI_MODEL, ai_max=AI_MAX_CALLS)
+                ai=ai_cfg(), ocr=ocr_cfg())
 
 
 @app.route("/preview", methods=["POST"])
@@ -1434,7 +1718,7 @@ def preview():
     corr_ids = {int(x) for x in request.form.getlist("corr") if x.isdigit()}
     corr_none = request.form.get("corr_none") == "1"
     hide_merged = request.form.get("hide_merged") == "1"
-    use_ai = AI_ENABLED and request.form.get("use_ai") == "1"
+    use_ai = (ai_cfg()["enabled"] or ocr_cfg()["enabled"]) and request.form.get("use_ai") == "1"
 
     try:
         pl = Paperless()
@@ -1741,16 +2025,59 @@ def cleanup_titles():
     return page(CLEANUP, msg=msg, errors=errors)
 
 
-@app.route("/ki/test")
+@app.route("/einstellungen", methods=["GET", "POST"])
 @require_auth
-def ki_test():
-    if not AI_ENABLED:
-        return page(CLEANUP, msg="KI-Unterstützung ist nicht eingerichtet (AI_API_KEY fehlt).", errors=[])
-    try:
-        AI(budget=1).test()
-        return page(CLEANUP, msg=f"✓ Verbindung zur KI erfolgreich – Anbieter {AI_BASE_URL}, Modell {AI_MODEL}.", errors=[])
-    except AIError as e:
-        return page(CLEANUP, msg=f"Verbindung zur KI fehlgeschlagen ({AI_BASE_URL}, Modell {AI_MODEL}).", errors=[str(e)])
+def settings():
+    msgs = []
+    if request.method == "POST":
+        f = request.form
+        cur = load_settings()
+        new = {"ai": dict(cur["ai"]), "ocr": dict(cur["ocr"])}
+        new["ocr"]["provider"] = f.get("ocr_provider") if f.get("ocr_provider") in ("off", *OCR_PROVIDERS) else "off"
+        new["ocr"]["model"] = f.get("ocr_model", "").strip()
+        new["ai"]["provider"] = f.get("ai_provider") if f.get("ai_provider") in ("off", "custom", *AI_PROVIDERS) else "off"
+        new["ai"]["model"] = f.get("ai_model", "").strip()
+        new["ai"]["base_url"] = f.get("ai_base_url", "").strip() if new["ai"]["provider"] == "custom" else ""
+        for sec in ("ai", "ocr"):
+            try:
+                new[sec]["max_calls"] = max(1, int(f.get(f"{sec}_max_calls") or new[sec]["max_calls"]))
+            except ValueError:
+                pass
+            if f.get(f"{sec}_clear") == "1":
+                new[sec]["api_key"] = ""
+            if f.get(f"{sec}_api_key", "").strip():
+                new[sec]["api_key"] = f.get(f"{sec}_api_key").strip()
+        try:
+            save_settings(new)
+            msgs.append(("ok", "✓ Einstellungen gespeichert."))
+        except OSError as e:
+            msgs.append(("err", f"Speichern nicht möglich ({e}). Ist das Volume ./data:/data eingebunden?"))
+        action = f.get("action")
+        if action == "test_ocr":
+            o = OCR(budget=1)
+            if not o.enabled:
+                msgs.append(("err", "Texterkennung ist nicht aktiv – Anbieter und Schlüssel prüfen."))
+            else:
+                try:
+                    o.test()
+                    msgs.append(("ok", f"✓ Texterkennung funktioniert ({o.cfg['model']})."))
+                except AIError as e:
+                    msgs.append(("err", f"Texterkennung fehlgeschlagen: {e}"))
+        elif action == "test_ai":
+            a = AI(budget=1)
+            if not a.cfg["enabled"]:
+                msgs.append(("err", "Auswertung ist nicht aktiv – Anbieter, Schlüssel und Modell prüfen."))
+            else:
+                try:
+                    a.test()
+                    msgs.append(("ok", f"✓ Auswertung funktioniert ({a.cfg['model']} · {a.cfg['base_url']})."))
+                except AIError as e:
+                    msgs.append(("err", f"Auswertung fehlgeschlagen: {e}"))
+    st = load_settings()
+    writable = os.access(os.path.dirname(SETTINGS_FILE) or ".", os.W_OK)
+    return page(SETTINGS, msgs=msgs, st=st, ai=ai_cfg(st), ocr=ocr_cfg(st), mask=mask_key,
+                ai_defaults={k: v[1] for k, v in AI_PROVIDERS.items()}, ocr_default=OCR_PROVIDERS["mistral"][1],
+                settings_file=SETTINGS_FILE, writable=writable, protected=bool(APP_USER and APP_PASSWORD))
 
 
 @app.route("/audit")
@@ -1758,7 +2085,8 @@ def ki_test():
 def audit(error=None):
     today = dt.date.today()
     return page(AUDIT_FORM, error=error, start=(today - dt.timedelta(days=365)).isoformat(), end=today.isoformat(),
-                max_docs=AUDIT_MAX_DOCS, merged_tag=MERGED_TAG)
+                max_docs=AUDIT_MAX_DOCS, merged_tag=MERGED_TAG, ocr_enabled=ocr_cfg()["enabled"],
+                ocr_model=ocr_cfg()["model"])
 
 
 @app.route("/audit/start", methods=["POST"])
@@ -1776,7 +2104,8 @@ def audit_start():
     AUDIT_JOBS[job_id] = {"ts": time.time(), "status": "läuft", "done": 0, "total": 0, "results": [],
                           "start": start.isoformat(), "end": end.isoformat(), "fixed": set(),
                           "dir": tempfile.mkdtemp(prefix="pm-audit-")}
-    threading.Thread(target=_run_audit, args=(job_id, start, end), daemon=True).start()
+    use_ocr = request.form.get("use_ocr") == "1" and ocr_cfg()["enabled"]
+    threading.Thread(target=_run_audit, args=(job_id, start, end, use_ocr), daemon=True).start()
     return redirect(url_for("audit_job", job_id=job_id))
 
 

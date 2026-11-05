@@ -33,18 +33,14 @@ services:
       TZ: "Europe/Berlin"
       # Prüfung zusammengeführter Rechnungen: höchstens so viele Dokumente je Prüfung
       AUDIT_MAX_DOCS: "200"
-      # --- KI-Unterstützung (optional, token-basiert über eine OpenAI-kompatible API) ---
-      # Anbieter: openai oder mistral (setzt Adresse und Standardmodell)
-      # AI_PROVIDER: "mistral"
-      # AI_API_KEY: "HIER_API_SCHLUESSEL"
-      # AI_MODEL: "mistral-small-latest"     # optional, sonst Standardmodell des Anbieters
-      # AI_BASE_URL: ""                      # optional, eigene Adresse (z. B. lokales Modell)
-      # AI_MAX_CALLS: "30"                   # höchstens so viele KI-Anfragen je Durchlauf
-      # optionaler Login für die Oberfläche
+      # --- KI-Unterstützung (optional) ---
+      # Zugänge werden in der Oberfläche unter "⚙ Einstellungen" eingerichtet und in ./data gespeichert.
+      # Alternativ als Vorbelegung: OCR_PROVIDER/OCR_API_KEY (Mistral OCR), AI_PROVIDER/AI_API_KEY/AI_MODEL (Auswertung)
+      # optionaler Login für die Oberfläche – empfohlen, wenn KI-Zugänge hinterlegt sind
       # APP_USER: "markus"
       # APP_PASSWORD: "geheim"
     volumes:
-      - ./data:/data                         # Zwischenspeicher für KI-Ergebnisse (spart Tokens)
+      - ./data:/data                         # Einstellungen und KI-Zwischenspeicher
 
 # Nur wenn du Paperless per Containername ansprechen willst:
 # Netzwerk von Paperless hier eintragen (docker network ls) und oben beim Service
