@@ -11,7 +11,13 @@ Ablauf:
       kommen von der Rechnung -> neues Dokument ist Typ "Rechnung")
 """
 import datetime as dt
+import difflib
+import hashlib
+import io
+import json
 import os
+import shutil
+import tempfile
 import re
 import threading
 import time
@@ -38,6 +44,21 @@ VERIFY_SSL = os.environ.get("VERIFY_SSL", "true").lower() not in ("0", "false", 
 APP_USER = os.environ.get("APP_USER")
 APP_PASSWORD = os.environ.get("APP_PASSWORD")
 AUTO_CLEAN_TITLES = os.environ.get("AUTO_CLEAN_TITLES", "true").lower() not in ("0", "false", "no")
+# KI-Anbindung über eine OpenAI-kompatible API (token-basiert abgerechnet)
+AI_PROVIDERS = {  # Anbieter mit OpenAI-kompatibler API: (Adresse, Standardmodell)
+    "openai": ("https://api.openai.com/v1", "gpt-4o-mini"),
+    "mistral": ("https://api.mistral.ai/v1", "mistral-small-latest"),
+}
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "openai").strip().lower()
+AI_API_KEY = os.environ.get("AI_API_KEY", "").strip()
+AI_BASE_URL = (os.environ.get("AI_BASE_URL") or AI_PROVIDERS.get(AI_PROVIDER, AI_PROVIDERS["openai"])[0]).rstrip("/")
+AI_MODEL = (os.environ.get("AI_MODEL") or AI_PROVIDERS.get(AI_PROVIDER, ("", ""))[1]).strip()
+AI_ENABLED = bool(AI_MODEL) and (bool(AI_API_KEY) or os.environ.get("AI_ENABLED", "").lower() in ("1", "true", "yes"))
+AI_MAX_CALLS = int(os.environ.get("AI_MAX_CALLS", "30"))      # Höchstzahl KI-Anfragen pro Durchlauf
+AI_MAX_CHARS = int(os.environ.get("AI_MAX_CHARS", "6000"))    # Textlänge je Dokument, die an die KI geht
+AI_TIMEOUT = int(os.environ.get("AI_TIMEOUT", "60"))
+AI_CACHE_FILE = os.environ.get("AI_CACHE_FILE", "/data/ki-cache.json")
+AUDIT_MAX_DOCS = int(os.environ.get("AUDIT_MAX_DOCS", "200"))
 # Vorgaben für die Suche nach Rechnungen zu nicht zugeordneten Lieferscheinen
 SEARCH_DOCTYPES = [t.strip() for t in os.environ.get("SEARCH_DOCTYPES", TYPE_INVOICE).split(",") if t.strip()]
 SEARCH_DAYS_BEFORE = int(os.environ.get("SEARCH_DAYS_BEFORE", "30"))
@@ -80,8 +101,40 @@ class Paperless:
     def send(self, method, path, payload):
         r = self.s.request(method, PAPERLESS_URL + path, json=payload, timeout=120)
         if r.status_code >= 400:
-            raise RuntimeError(f"{method} {path}: HTTP {r.status_code} – {r.text[:300]}")
-        return r.json() if r.content else {}
+            err = RuntimeError(f"{method} {path}: HTTP {r.status_code} – {r.text[:300]}")
+            err.status = r.status_code
+            raise err
+        try:
+            return r.json() if r.content else {}
+        except ValueError:
+            return {"result": r.text}
+
+    def _send_new_or_legacy(self, new_path, new_payload, legacy_payload):
+        """Neuer Endpunkt (Paperless 3.x), bei 404/405 der alte bulk_edit-Weg (Paperless 2.x)."""
+        try:
+            return self.send("POST", new_path, new_payload)
+        except RuntimeError as e:
+            if getattr(e, "status", None) not in (404, 405):
+                raise
+        return self.send("POST", "/api/documents/bulk_edit/", legacy_payload)
+
+    def download(self, doc_id, original=False):
+        """PDF eines Dokuments (Archivversion mit Textebene, wenn vorhanden)."""
+        r = self.s.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/",
+                       params={"original": "true"} if original else None, timeout=120)
+        r.raise_for_status()
+        return r.content
+
+    def remove_pages(self, doc_id, pages, page_count):
+        """Entfernt Seiten (1-basiert) aus einem Dokument. Paperless legt eine neue Version an."""
+        keep = [p for p in range(1, page_count + 1) if p not in set(pages)]
+        if not keep:
+            raise RuntimeError("Es dürfen nicht alle Seiten entfernt werden.")
+        return self._send_new_or_legacy(
+            "/api/documents/edit_pdf/",
+            {"documents": [doc_id], "operations": [{"page": p} for p in keep], "update_document": True},
+            {"documents": [doc_id], "method": "delete_pages", "parameters": {"pages": sorted(set(pages))}},
+        )
 
     def all(self, path, **params):
         params.setdefault("page_size", 100)
@@ -129,7 +182,7 @@ class Paperless:
     def find_docs(self, type_ids, start=None, end=None, corr_id=None, content=None):
         """Dokumente bestimmter Typen, optional nach Zeitraum, Korrespondent und Textinhalt gefiltert."""
         params = {"fields": "id,title,correspondent,created,content,tags,archive_serial_number,document_type,"
-                            "original_file_name",
+                            "original_file_name,page_count",
                   "ordering": "created"}
         if type_ids:
             params["document_type__id__in"] = ",".join(map(str, sorted(type_ids)))
@@ -155,11 +208,12 @@ class Paperless:
         return {c["id"]: c["name"] for c in self.all("/api/correspondents/")}
 
     def merge(self, doc_ids, metadata_id, delete_originals):
-        return self.send("POST", "/api/documents/bulk_edit/", {
-            "documents": doc_ids,
-            "method": "merge",
-            "parameters": {"metadata_document_id": metadata_id, "delete_originals": delete_originals},
-        })
+        return self._send_new_or_legacy(
+            "/api/documents/merge/",
+            {"documents": doc_ids, "metadata_document_id": metadata_id, "delete_originals": delete_originals},
+            {"documents": doc_ids, "method": "merge",
+             "parameters": {"metadata_document_id": metadata_id, "delete_originals": delete_originals}},
+        )
 
     def tags(self):
         return sorted(self.all("/api/tags/"), key=lambda t: t["name"].lower())
@@ -304,12 +358,13 @@ def level_of(score):
     return "unsicher"
 
 
-def build_plan(invoices, deliveries, corr, inv_start, hide_merged=True):
+def build_plan(invoices, deliveries, corr, inv_start, hide_merged=True, ls_extra=None, inv_extra=None):
     """Erzeugt Zuordnungsvorschläge. Jeder Lieferschein wird höchstens einer Rechnung zugeordnet."""
     inv_text = {i["id"]: f"{i.get('title', '')}\n{i.get('content', '')}".upper() for i in invoices}
-    inv_refs = {i["id"]: extract_numbers(i.get("content")) for i in invoices}
+    ls_extra, inv_extra = ls_extra or {}, inv_extra or {}
+    inv_refs = {i["id"]: extract_numbers(i.get("content")) | set(inv_extra.get(i["id"], [])) for i in invoices}
     ls_text = {d["id"]: f"{d.get('title', '')}\n{d.get('content', '')}".upper() for d in deliveries}
-    ls_nums = {d["id"]: delivery_numbers(d) for d in deliveries}
+    ls_nums = {d["id"]: delivery_numbers(d) | set(ls_extra.get(d["id"], [])) for d in deliveries}
     inv_fz = {k: v.translate(OCR_MAP) for k, v in inv_text.items()}
     ls_fz = {k: v.translate(OCR_MAP) for k, v in ls_text.items()}
     all_ls_nums = sorted({n for ns in ls_nums.values() for n in ns})
@@ -402,21 +457,350 @@ def build_plan(invoices, deliveries, corr, inv_start, hide_merged=True):
             lvl = level_of(score)
             items.append({**summarize(ls_by_id[ls_id], corr), "score": score, "reason": reason,
                           "level": lvl, "checked": lvl != "unsicher",
-                          "nums": [{"n": x, "hit": matched is not None and ocr_norm(x) == ocr_norm(matched)}
-                                   for x in sorted(ls_nums[ls_id])]})
+                          "nums": [{"n": x, "hit": matched is not None and ocr_norm(x) == ocr_norm(matched),
+                                    "ai": x in ls_extra.get(ls_id, [])} for x in sorted(ls_nums[ls_id])]})
         items.sort(key=lambda x: x["date"])
         hits = {ocr_norm(i["nums"][k]["n"]) for i in items for k in range(len(i["nums"])) if i["nums"][k]["hit"]}
         hits |= {ocr_norm(m[3]) for m in matches.get(inv["id"], []) if m[3]}
         inv_sum = summarize(inv, corr)
-        inv_sum["nums"] = [{"n": x, "hit": ocr_norm(x) in hits} for x in inv_found[inv["id"]]]
+        inv_sum["nums"] = [{"n": x, "hit": ocr_norm(x) in hits, "ai": x in inv_extra.get(inv["id"], [])}
+                           for x in inv_found[inv["id"]]]
         entry = {"inv": inv_sum, "items": items,
                  "checked": any(i["checked"] for i in items)}
         (groups if items else without).append(entry)
 
-    unassigned = [{**summarize(d, corr), "nums": [{"n": x, "hit": False} for x in sorted(ls_nums[d["id"]])]}
+    unassigned = [{**summarize(d, corr), "nums": [{"n": x, "hit": False, "ai": x in ls_extra.get(d["id"], [])}
+                                                   for x in sorted(ls_nums[d["id"]])]}
                   for d in deliveries if d["id"] not in used_ls]
     return {"groups": groups, "without": without, "unassigned": unassigned,
             "contained": contained, "hidden": hidden}
+
+
+def ai_enhance(invoices, deliveries, corr, inv_start, hide_merged, plan):
+    """Verbessert den Plan mit KI: fehlende Nummern ergänzen und unsichere Vorschläge prüfen."""
+    ai = AI()
+    stats = {"extracted": 0, "verified": 0, "upgraded": 0, "rejected": 0}
+    text = {d["id"]: f"{d.get('title', '')}\n{d.get('content', '')}" for d in invoices + deliveries}
+
+    # 1. Lieferscheine ohne erkannte Nummer
+    ls_extra = {}
+    for d in deliveries:
+        if not delivery_numbers(d):
+            nums = ai.extract_numbers(text[d["id"]], "ls")
+            if nums:
+                ls_extra[d["id"]] = nums
+    # 2. Rechnungen ohne sicheren Lieferschein
+    inv_extra = {}
+    weak = [g["inv"]["id"] for g in plan["without"]] + \
+           [g["inv"]["id"] for g in plan["groups"] if all(i["level"] == "unsicher" for i in g["items"])]
+    for inv_id in weak:
+        nums = ai.extract_numbers(text[inv_id], "inv")
+        if nums:
+            inv_extra[inv_id] = nums
+    stats["extracted"] = sum(len(v) for v in ls_extra.values()) + sum(len(v) for v in inv_extra.values())
+    if ls_extra or inv_extra:
+        plan = build_plan(invoices, deliveries, corr, inv_start, hide_merged, ls_extra, inv_extra)
+
+    # 3. unsichere Vorschläge prüfen lassen
+    for g in plan["groups"]:
+        for i in g["items"]:
+            if i["level"] != "unsicher":
+                continue
+            v = ai.verify_pair(text[g["inv"]["id"]], text[i["id"]])
+            if not v:
+                continue
+            stats["verified"] += 1
+            pct = round(v["sicherheit"] * 100)
+            if v["passt"] and v["sicherheit"] >= 0.75:
+                i.update(level="sicher", checked=True, ai=True,
+                         reason=f"KI: passt ({pct} %) – {v['begruendung']}")
+                stats["upgraded"] += 1
+            elif not v["passt"] and v["sicherheit"] >= 0.6:
+                i.update(checked=False, ai=True, reason=f"KI: passt nicht ({pct} %) – {v['begruendung']}")
+                stats["rejected"] += 1
+            else:
+                i.update(ai=True, reason=f"{i['reason']} · KI unsicher ({pct} %): {v['begruendung']}")
+        g["checked"] = any(i["checked"] for i in g["items"])
+    stats["calls"] = ai.calls
+    stats["budget_hit"] = ai.calls >= ai.budget
+    stats["errors"] = ai.errors[-3:]
+    return plan, stats
+
+
+# --------------------------------------------------------------------------- KI
+class AIError(RuntimeError):
+    pass
+
+
+class AI:
+    """Schlanker Client für OpenAI-kompatible Chat-APIs mit Ergebnis-Cache und Anfragen-Budget."""
+    _cache = None
+    _lock = threading.Lock()
+
+    def __init__(self, budget=AI_MAX_CALLS):
+        self.budget = budget
+        self.calls = 0
+        self.errors = []
+
+    @classmethod
+    def _load_cache(cls):
+        if cls._cache is None:
+            cls._cache = {}
+            try:
+                with open(AI_CACHE_FILE, encoding="utf-8") as f:
+                    cls._cache = json.load(f)
+            except (OSError, ValueError):
+                pass
+        return cls._cache
+
+    @classmethod
+    def _save_cache(cls):
+        try:
+            os.makedirs(os.path.dirname(AI_CACHE_FILE) or ".", exist_ok=True)
+            tmp = AI_CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cls._cache, f, ensure_ascii=False)
+            os.replace(tmp, AI_CACHE_FILE)
+        except OSError:
+            pass  # Cache ist optional
+
+    def chat_json(self, system, user, cache_key=None):
+        """Schickt eine Anfrage und liefert das JSON-Objekt der Antwort (oder None bei Budget-Ende/Fehler)."""
+        if cache_key:
+            with self._lock:
+                hit = self._load_cache().get(cache_key)
+            if hit is not None:
+                return hit
+        if self.calls >= self.budget:
+            return None
+        self.calls += 1
+        headers = {"Content-Type": "application/json"}
+        if AI_API_KEY:
+            headers["Authorization"] = f"Bearer {AI_API_KEY}"
+        body = {"model": AI_MODEL, "temperature": 0,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        try:
+            r = requests.post(f"{AI_BASE_URL}/chat/completions", json=body, headers=headers, timeout=AI_TIMEOUT)
+            if r.status_code >= 400:
+                raise AIError(f"HTTP {r.status_code}: {r.text[:200]}")
+            text = r.json()["choices"][0]["message"]["content"] or ""
+            m = re.search(r"\{.*\}", text, re.S)
+            if not m:
+                raise AIError(f"keine JSON-Antwort: {text[:120]}")
+            result = json.loads(m.group(0))
+        except (requests.RequestException, AIError, ValueError, KeyError, IndexError) as e:
+            self.errors.append(str(e))
+            return None
+        if cache_key:
+            with self._lock:
+                self._load_cache()[cache_key] = result
+                self._save_cache()
+        return result
+
+    @staticmethod
+    def _key(kind, *texts):
+        h = hashlib.sha256(("\x00".join([AI_MODEL, kind, *texts])).encode("utf-8")).hexdigest()
+        return f"{kind}:{h[:32]}"
+
+    def extract_numbers(self, text, kind):
+        """Liefert die Lieferscheinnummern, die die KI im Dokumenttext findet."""
+        text = (text or "")[:AI_MAX_CHARS]
+        if len(text.strip()) < 20:
+            return []
+        system = ("Du analysierst OCR-Text deutscher Geschäftsdokumente. Antworte ausschließlich mit JSON "
+                  'im Format {"lieferscheinnummern": ["..."]}.')
+        what = ("die eigene Lieferscheinnummer dieses Lieferscheins (auch Beleg-Nr., Liefer-Nr.)" if kind == "ls"
+                else "alle Lieferscheinnummern, auf die sich diese Rechnung bezieht (auch Beleg-Nr., Liefer-Nr.)")
+        user = (f"Dokumentart: {'Lieferschein' if kind == 'ls' else 'Rechnung'}.\n"
+                f"Gib {what} zurück. Keine Rechnungs-, Kunden-, Bestell-, Artikel- oder Auftragsnummern, "
+                "keine Datumsangaben. Nummern genau so übernehmen, wie sie im Text stehen. "
+                "Wenn keine vorhanden: leere Liste.\n\n--- TEXT ---\n" + text)
+        res = self.chat_json(system, user, self._key("ext-" + kind, text))
+        out = []
+        for n in (res or {}).get("lieferscheinnummern", []) or []:
+            n = re.sub(r"\s+", "", str(n)).upper().strip(".,;:")
+            if n and sum(c.isdigit() for c in n) >= 4 and n not in out:
+                out.append(n)
+        return out
+
+    def verify_pair(self, inv_text, ls_text):
+        """Prüft, ob Lieferschein und Rechnung zusammengehören. Rückgabe dict oder None."""
+        inv_text, ls_text = (inv_text or "")[:AI_MAX_CHARS], (ls_text or "")[:AI_MAX_CHARS]
+        system = ("Du prüfst, ob ein Lieferschein zu einer Rechnung gehört. Antworte ausschließlich mit JSON "
+                  '{"passt": true|false, "sicherheit": 0.0-1.0, "nummer": "gemeinsame Lieferscheinnummer oder null", '
+                  '"begruendung": "kurz, deutsch, max. 20 Wörter"}.')
+        user = ("Gehört der Lieferschein zur Rechnung? Achte auf Lieferscheinnummern, Positionen, Mengen, "
+                "Lieferadresse, Datum und Lieferant. OCR-Fehler wie LI/11 oder O/0 sind möglich.\n\n"
+                "--- RECHNUNG ---\n" + inv_text + "\n\n--- LIEFERSCHEIN ---\n" + ls_text)
+        res = self.chat_json(system, user, self._key("pair", inv_text, ls_text))
+        if not isinstance(res, dict) or "passt" not in res:
+            return None
+        try:
+            conf = float(res.get("sicherheit", 0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {"passt": bool(res.get("passt")), "sicherheit": max(0.0, min(conf, 1.0)),
+                "nummer": res.get("nummer") or None, "begruendung": str(res.get("begruendung") or "")[:200]}
+
+    def test(self):
+        res = self.chat_json("Antworte ausschließlich mit JSON.", 'Gib {"ok": true} zurück.')
+        if res is None:
+            raise AIError(self.errors[-1] if self.errors else "keine Antwort")
+        return res
+
+
+# --------------------------------------------------------------------------- Prüfung zusammengeführter Dokumente
+def _norm_page_text(t):
+    return re.sub(r"\s+", " ", (t or "").upper()).strip()
+
+
+def _dhash(img, size=16):
+    """Differenz-Hash eines Seitenbildes (size*size Bit) für den Bildvergleich."""
+    g = img.convert("L").resize((size + 1, size))
+    px = list(g.getdata())
+    bits = 0
+    for y in range(size):
+        row = px[y * (size + 1):(y + 1) * (size + 1)]
+        for x in range(size):
+            bits = (bits << 1) | (1 if row[x] > row[x + 1] else 0)
+    return bits
+
+
+def analyze_pdf(pdf_bytes):
+    """Liefert je Seite: Text, Lieferscheinnummern und Bild-Hash."""
+    import pypdf
+    import pypdfium2 as pdfium
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+    texts = []
+    for p in reader.pages:
+        try:
+            texts.append(p.extract_text() or "")
+        except Exception:  # noqa: BLE001
+            texts.append("")
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    pages = []
+    try:
+        for i in range(len(pdf)):
+            page = pdf[i]
+            w = page.get_width() or 595
+            img = page.render(scale=120 / w).to_pil()
+            t = texts[i] if i < len(texts) else ""
+            pages.append({"n": i + 1, "text": _norm_page_text(t), "nums": sorted(extract_numbers(t)),
+                          "hash": _dhash(img)})
+    finally:
+        pdf.close()
+    return pages
+
+
+def find_duplicate_pages(pages):
+    """Vergleicht alle Seiten eines Dokuments. Rückgabe: {seite: (original_seite, stufe, grund)}."""
+    dups = {}
+    for j in range(len(pages)):
+        best = None
+        for i in range(j):
+            if pages[i]["n"] in dups:  # nur mit Originalen vergleichen
+                continue
+            a, b = pages[i]["text"], pages[j]["text"]
+            ham = bin(pages[i]["hash"] ^ pages[j]["hash"]).count("1")
+            if len(a) >= 40 and len(b) >= 40:
+                sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+                if sm.quick_ratio() < 0.85:
+                    continue
+                ratio = sm.ratio()
+                if ratio >= 0.95:
+                    cand = (pages[i]["n"], "sicher", f"Text zu {round(ratio * 100)} % gleich wie Seite {pages[i]['n']}")
+                elif ratio >= 0.85:
+                    cand = (pages[i]["n"], "möglich", f"Text zu {round(ratio * 100)} % ähnlich wie Seite {pages[i]['n']}")
+                else:
+                    continue
+            elif ham <= 6:  # Seiten ohne Textebene: nur Bildvergleich
+                cand = (pages[i]["n"], "möglich", f"Seitenbild nahezu gleich wie Seite {pages[i]['n']} (kein Text erkannt)")
+            else:
+                continue
+            if best is None or (cand[1] == "sicher" and best[1] != "sicher"):
+                best = cand
+        if best:
+            dups[pages[j]["n"]] = best
+    return dups
+
+
+def _is_ls_page(page):
+    head = page["text"][:400]
+    return bool(page["nums"]) and page["n"] > 1 and "RECHNUNG" not in head
+
+
+AUDIT_JOBS = {}
+
+
+def _run_audit(job_id, start, end):
+    job = AUDIT_JOBS[job_id]
+    try:
+        pl = Paperless()
+        t_inv = pl.id_by_name("/api/document_types/", TYPE_INVOICE)
+        merged_tag = pl.id_by_name("/api/tags/", MERGED_TAG)
+        corr = pl.correspondents()
+        docs = [d for d in pl.find_docs({t_inv} if t_inv else set(), start, end) if is_merged_doc(d, merged_tag)]
+        docs.sort(key=lambda d: str(d.get("created")), reverse=True)
+        if len(docs) > AUDIT_MAX_DOCS:
+            job["truncated"] = len(docs)
+            docs = docs[:AUDIT_MAX_DOCS]
+        job["total"] = len(docs)
+        results = []
+        for d in docs:
+            entry = {**summarize(d, corr), "pages": [], "dups": {}, "error": None}
+            try:
+                pdf = pl.download(d["id"])
+                with open(os.path.join(job["dir"], f"{d['id']}.pdf"), "wb") as f:
+                    f.write(pdf)
+                pages = analyze_pdf(pdf)
+                entry["pages"] = [{"n": p["n"], "nums": p["nums"], "ls": _is_ls_page(p)} for p in pages]
+                entry["dups"] = find_duplicate_pages(pages)
+                entry["_pages"] = pages
+            except Exception as e:  # noqa: BLE001
+                entry["error"] = str(e)[:200]
+            results.append(entry)
+            job["done"] += 1
+        # dokumentübergreifend: dieselbe Lieferscheinnummer auf Lieferschein-Seiten mehrerer Dokumente
+        where = {}
+        for e in results:
+            for p in e.get("_pages", []):
+                if _is_ls_page(p):
+                    for n in p["nums"]:
+                        where.setdefault(ocr_norm(n), []).append((e["id"], p["n"], n))
+        for e in results:
+            e["cross"] = []
+            for key, places in where.items():
+                docs_with = {x[0] for x in places}
+                if e["id"] in docs_with and len(docs_with) > 1:
+                    mine = sorted({x[1] for x in places if x[0] == e["id"]})
+                    others = {}
+                    for x in places:
+                        if x[0] != e["id"]:
+                            others.setdefault(x[0], set()).add(x[1])
+                    others = [(k, sorted(v)) for k, v in others.items()]
+                    e["cross"].append({"num": places[0][2], "pages": mine, "others": others})
+            # gleiche Nummer auf nicht zusammenhängenden Lieferschein-Seiten im selben Dokument
+            e["repeat"] = []
+            for key, places in where.items():
+                mine = sorted({x[1] for x in places if x[0] == e["id"]})
+                if len(mine) > 1 and any(b - a > 1 for a, b in zip(mine, mine[1:])):
+                    e["repeat"].append({"num": places[0][2], "pages": mine})
+            e.pop("_pages", None)
+            e["issues"] = len(e["dups"]) + len(e["cross"]) + len(e["repeat"]) + (1 if e["error"] else 0)
+        titles = {e["id"]: e["title"] for e in results}
+        job["titles"] = titles
+        job["results"] = results
+        job["status"] = "fertig"
+    except Exception as e:  # noqa: BLE001
+        job["status"] = "fehler"
+        job["error"] = str(e)[:300]
+
+
+def _cleanup_audit_jobs(ttl=3 * 3600):
+    now = time.time()
+    for k in [k for k, v in AUDIT_JOBS.items() if now - v["ts"] > ttl]:
+        shutil.rmtree(AUDIT_JOBS[k]["dir"], ignore_errors=True)
+        AUDIT_JOBS.pop(k, None)
 
 
 # --------------------------------------------------------------------------- Suche nach Rechnungen zu Lieferscheinen
@@ -551,6 +935,13 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.pagegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-top:12px}
+.pg{border:2px solid var(--line);border-radius:10px;padding:6px;background:var(--surface2);display:flex;flex-direction:column;gap:4px;cursor:pointer}
+.pg img{width:100%;aspect-ratio:1/1.414;object-fit:cover;border-radius:6px;background:#fff}
+.pg.dup{border-color:var(--bad);background:var(--bad-bg)}
+.pg.maybe{border-color:var(--warn);background:var(--warn-bg)}
+.pgl{font-size:.78rem}.pgd{font-size:.72rem;color:var(--muted)}.pgc{font-size:.8rem;display:flex;gap:6px;align-items:center}
+.ai{display:inline-block;font-size:.68rem;font-weight:700;padding:0 6px;border-radius:6px;background:var(--accent-soft);color:var(--accent);margin-left:4px}
 .ulist{display:flex;flex-direction:column;gap:2px;margin-top:8px}
 .urow{display:flex;gap:12px;align-items:center;padding:8px 6px;border-radius:10px;cursor:pointer}
 .urow:hover{background:var(--surface2)}
@@ -576,6 +967,7 @@ ul{padding-left:18px}
 </style></head><body>
 <header><a href="{{ url_for('index') }}" class="home"><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></a>
 <nav class="hnav"><a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
+<a class="hbtn" href="{{ url_for('audit') }}">🔎 Prüfen</a>
 {% if paperless_link %}<a class="hbtn" href="{{ paperless_link }}" target="_blank" rel="noopener">Paperless öffnen ↗</a>{% endif %}
 <span class="ver">v{{ version }}</span></nav></header>
 <main>
@@ -605,6 +997,11 @@ INDEX = """
    <p class="meta">Ohne Haken bleiben die Originale erhalten.</p>
    <label class="switch"><input type="checkbox" name="hide_merged" value="1" checked>
      Bereits ergänzte Rechnungen ausblenden</label>
+   {% if ai_enabled %}<label class="switch"><input type="checkbox" name="use_ai" value="1" checked>
+     🤖 KI-Unterstützung nutzen</label>
+   <p class="meta">Modell <code>{{ ai_model }}</code> · ergänzt fehlende Lieferscheinnummern und prüft unsichere Vorschläge
+     (höchstens {{ ai_max }} Anfragen je Durchlauf) · <a href="{{ url_for('ki_test') }}">Verbindung testen</a></p>
+   {% else %}<p class="meta">🤖 KI-Unterstützung ist nicht eingerichtet (siehe Anleitung, Abschnitt KI).</p>{% endif %}
    <p class="meta">Verwendete Lieferscheine bekommen das Tag „{{ done_tag }}“, die Rechnungen das Tag „{{ merged_tag }}“.
      Beide werden beim nächsten Lauf nicht mehr angeboten – auch ältere zusammengeführte Rechnungen werden erkannt.</p>
   </section>
@@ -657,6 +1054,11 @@ PREVIEW = """
 <form method="post" action="{{ url_for('execute') }}" id="f">
 <input type="hidden" name="plan" value="{{ plan_id }}">
 {% if info %}<div class="card ok">{{ info }}</div>{% endif %}
+{% if ai_stats %}<div class="card {{ 'err' if ai_stats.errors and not ai_stats.calls }}">🤖 <b>KI-Unterstützung:</b>
+  {{ ai_stats.calls }} Anfrage(n) · {{ ai_stats.extracted }} Nummer(n) ergänzt · {{ ai_stats.verified }} unsichere Vorschläge geprüft
+  ({{ ai_stats.upgraded }} bestätigt, {{ ai_stats.rejected }} verworfen)
+  {% if ai_stats.budget_hit %}<br><span class="meta">Höchstzahl an KI-Anfragen erreicht (AI_MAX_CALLS) – nicht alles wurde geprüft.</span>{% endif %}
+  {% for e in ai_stats.errors %}<br><span class="meta" style="color:var(--bad)">Fehler: {{ e }}</span>{% endfor %}</div>{% endif %}
 <div class="card"><h3>2 · Zuordnungen prüfen</h3>
   <div class="meta">Zeitraum {{ start.strftime('%d.%m.%Y') }} – {{ end.strftime('%d.%m.%Y') }}</div>
   <div class="stats">
@@ -686,17 +1088,17 @@ PREVIEW = """
       <span class="meta">{{ g.inv.date|de }} · {{ g.inv.correspondent }}{% if g.inv.asn %} · ASN {{ g.inv.asn }}{% endif %} ·
       <a href="{{ link(g.inv.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span>
       <div class="nums"><span class="nl">Lieferschein-Nr. in der Rechnung:</span>
-        {% for x in g.inv.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}</span>{% else %}<span class="none">keine gefunden</span>{% endfor %}</div></div>
+        {% for x in g.inv.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}{% if x.ai %}<span class="ai">KI</span>{% endif %}</span>{% else %}<span class="none">keine gefunden</span>{% endfor %}</div></div>
   </div>
   {% if g['items'] %}<div class="items">{% endif %}
   {% for i in g['items'] %}
   <div class="row">
     <input type="checkbox" name="ls_{{ g.inv.id }}" value="{{ i.id }}" class="ls" data-inv="{{ g.inv.id }}" {{ 'checked' if i.checked }}>
     <a href="{{ link(i.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=i.id) }}"></a>
-    <div><span class="badge {{ i.level }}">{{ i.level }}</span> <b>{{ i.title }}</b><br>
+    <div><span class="badge {{ i.level }}">{{ i.level }}</span>{% if i.ai %}<span class="ai">🤖 KI</span>{% endif %} <b>{{ i.title }}</b><br>
       <span class="meta">{{ i.date|de }} · {{ i.correspondent }} · {{ i.reason }}</span>
       <div class="nums"><span class="nl">Erkannte Nr.:</span>
-        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}
+        {% for x in i.nums %}<span class="num {{ 'hit' if x.hit }}">{{ x.n }}{% if x.ai %}<span class="ai">KI</span>{% endif %}</span>{% else %}<span class="none">keine erkannt</span>{% endfor %}
         {% if i.level == 'unsicher' %}<button type="submit" class="linkbtn" formaction="{{ url_for('search_ls') }}"
           name="find_ls" value="{{ i.id }}" data-search1>🔍 Rechnung in Paperless suchen</button>{% endif %}</div></div>
   </div>
@@ -863,6 +1265,95 @@ document.getElementById('sf').addEventListener('submit', e => {
 {% endif %}
 """
 
+AUDIT_FORM = """
+{% if error %}<div class="card err">{{ error }}</div>{% endif %}
+<form class="card" method="post" action="{{ url_for('audit_start') }}">
+  <h3>🔎 Zusammengeführte Rechnungen prüfen</h3>
+  <p class="meta" style="margin-top:0">Prüft alle Rechnungen, die schon mit Lieferscheinen zusammengeführt wurden
+    (Tag „{{ merged_tag }}“ oder Paperless-Datei „…_merged.pdf“): Sind Seiten doppelt enthalten? Steckt derselbe
+    Lieferschein in mehreren Rechnungen? Gefundene Doppelungen lassen sich anschließend gezielt entfernen.</p>
+  <div class="grid2">
+    <div><label class="f">Rechnungsdatum von</label><input type="date" name="start" value="{{ start }}" required></div>
+    <div><label class="f">Rechnungsdatum bis</label><input type="date" name="end" value="{{ end }}" required></div>
+  </div>
+  <p class="meta">Es werden höchstens {{ max_docs }} Dokumente geprüft (die neuesten zuerst). Jede PDF wird dafür einmal geladen.</p>
+  <div style="margin-top:16px"><button>Prüfung starten</button></div>
+</form>
+"""
+
+AUDIT_PROGRESS = """
+<meta http-equiv="refresh" content="2">
+<div class="card"><h3>🔎 Prüfung läuft …</h3>
+  <p>{{ job.done }} von {{ job.total if job.total else '?' }} Dokumenten geprüft.</p>
+  <div style="height:10px;border-radius:99px;background:var(--surface2);overflow:hidden">
+    <div style="height:100%;width:{{ (100 * job.done / job.total) if job.total else 3 }}%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div>
+  <p class="meta">Die Seite aktualisiert sich automatisch.</p></div>
+"""
+
+AUDIT_RESULT = """
+{% if job.status == 'fehler' %}<div class="card err">Fehler bei der Prüfung: {{ job.error }}</div>{% endif %}
+<form method="post" action="{{ url_for('audit_fix', job_id=job_id) }}" id="af">
+<div class="card"><h3>🔎 Prüfergebnis</h3>
+  <div class="meta">Zeitraum {{ job.start|de }} – {{ job.end|de }}</div>
+  <div class="stats">
+    <div class="stat"><b>{{ job.results|length }}</b><span class="meta">geprüft</span></div>
+    <div class="stat"><b>{{ flagged|length }}</b><span class="meta">mit Auffälligkeiten</span></div>
+    <div class="stat"><b>{{ dup_total }}</b><span class="meta">doppelte Seiten</span></div>
+  </div>
+  {% if job.truncated %}<p class="meta">Achtung: {{ job.truncated }} Dokumente gefunden, geprüft wurden die neuesten {{ job.results|length }}.
+    Für den Rest den Zeitraum verkleinern.</p>{% endif %}
+  <p class="meta"><span class="badge unsicher">sicher doppelt</span> Seite ist (fast) identisch mit einer früheren Seite – zum Löschen vorausgewählt ·
+    <span class="badge mittel">möglich</span> sehr ähnlich, bitte selbst ansehen – nicht vorausgewählt.
+    Die erste Seite (Rechnung) wird nie zum Löschen vorgeschlagen. Paperless legt beim Entfernen eine neue Dokumentversion an.</p>
+  <label class="switch"><input type="checkbox" id="showall"> auch unauffällige Dokumente anzeigen</label>
+</div>
+{% if not flagged %}<div class="card ok">Keine Auffälligkeiten gefunden – jeder Lieferschein ist nur einmal enthalten.</div>{% endif %}
+<div class="groups">
+{% for e in job.results %}
+<div class="card {{ '' if e.issues else 'clean' }}" {{ '' if e.issues else 'hidden' }}>
+  <div class="grp-head" style="align-items:flex-start">
+    <div style="flex:1;min-width:0"><span class="tag">{{ type_invoice }}</span> <b>{{ e.title }}</b>
+      {% if e.id in fixed %}<span class="badge sicher">korrigiert</span>{% endif %}<br>
+      <span class="meta">{{ e.date|de }} · {{ e.correspondent }} · {{ e.pages|length }} Seiten ·
+        <a href="{{ link(e.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span>
+      {% if e.error %}<div class="meta" style="color:var(--bad)">Konnte nicht geprüft werden: {{ e.error }}</div>{% endif %}
+      {% for c in e.cross %}<div class="nums"><span class="badge mittel">auch woanders</span>
+        LS-Nr. <span class="num">{{ c.num }}</span> (Seite {{ c.pages|join(', ') }}) steckt auch in
+        {% for o in c.others %}<a href="{{ link(o[0]) }}" target="_blank">{{ titles.get(o[0], o[0]) }}</a> (S. {{ o[1]|join(', ') }}){{ ', ' if not loop.last }}{% endfor %}</div>{% endfor %}
+      {% for r in e.repeat %}<div class="nums"><span class="badge mittel">mehrfach</span>
+        LS-Nr. <span class="num">{{ r.num }}</span> auf den Seiten {{ r.pages|join(', ') }}</div>{% endfor %}
+    </div>
+  </div>
+  {% if e.pages %}
+  <div class="pagegrid">
+  {% for p in e.pages %}{% set d = e.dups.get(p.n) %}
+    <label class="pg {{ 'dup' if d and d[1] == 'sicher' else ('maybe' if d else '') }}">
+      <img loading="lazy" src="{{ url_for('audit_page', job_id=job_id, doc_id=e.id, n=p.n) }}">
+      <div class="pgl"><b>S. {{ p.n }}</b>{% if p.nums %} · {{ p.nums|join(', ') }}{% endif %}</div>
+      {% if d %}<div class="pgd">{{ d[2] }}</div>{% endif %}
+      {% if p.n > 1 %}<span class="pgc"><input type="checkbox" name="del_{{ e.id }}" value="{{ p.n }}" class="delp"
+        {{ 'checked' if d and d[1] == 'sicher' and e.id not in fixed }}> löschen</span>{% endif %}
+    </label>
+  {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endfor %}
+</div>
+<div class="card bar"><a class="btn sec" href="{{ url_for('audit') }}">← Neue Prüfung</a>
+  <button type="submit">Markierte Seiten entfernen</button></div>
+</form>
+<script>
+document.getElementById('showall').addEventListener('change', e =>
+  document.querySelectorAll('.card.clean').forEach(c => c.hidden = !e.target.checked));
+document.getElementById('af').addEventListener('submit', e => {
+  const n = document.querySelectorAll('.delp:checked').length;
+  if (!n) { alert('Keine Seite markiert.'); e.preventDefault(); return; }
+  if (!confirm(n + ' Seite(n) aus den Dokumenten entfernen? Paperless legt dafür neue Versionen an.')) e.preventDefault();
+});
+</script>
+"""
+
 RESULT = """
 <div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Ergebnis</h3>
   {{ done|length }} Zusammenführung(en) an Paperless übergeben{% if errors %}, {{ errors|length }} Fehler{% endif %}.
@@ -877,6 +1368,18 @@ RESULT = """
   <p style="margin-top:14px;display:flex;gap:12px;flex-wrap:wrap">
     {% if back %}<a class="btn sec" href="{{ url_for('review', plan_id=back) }}">← Zurück zur Prüfseite</a>{% endif %}
     <a class="btn" href="{{ url_for('index') }}">Neuer Durchlauf</a></p></div>
+"""
+
+
+AUDIT_FIXED = """
+<div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Korrektur</h3>
+  {{ done|length }} Dokument(e) an Paperless übergeben{% if errors %}, {{ errors|length }} Fehler{% endif %}.
+  <p class="meta">Paperless erzeugt die bereinigten Dokumente im Hintergrund als neue Version – das dauert einen Moment.</p></div>
+{% for d in done %}<div class="card">✔ {{ d.title }}: Seite(n) {{ d.pages|join(', ') }} entfernt</div>{% endfor %}
+{% for e in errors %}<div class="card err">✘ {{ e }}</div>{% endfor %}
+<div class="card" style="display:flex;gap:12px;flex-wrap:wrap">
+  <a class="btn sec" href="{{ url_for('audit_job', job_id=job_id) }}">← Zurück zum Prüfergebnis</a>
+  <a class="btn" href="{{ url_for('audit') }}">Neue Prüfung</a></div>
 """
 
 
@@ -911,7 +1414,8 @@ def index(error=None):
     except Exception as e:  # noqa: BLE001
         error = error or f"Tags/Korrespondenten konnten nicht geladen werden: {e}"
     return page(INDEX, error=error, start=first_prev.isoformat(), end=today.isoformat(),
-                lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, merged_tag=MERGED_TAG, tags=tags, corrs=corrs)
+                lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, merged_tag=MERGED_TAG, tags=tags, corrs=corrs,
+                ai_enabled=AI_ENABLED, ai_model=AI_MODEL, ai_max=AI_MAX_CALLS)
 
 
 @app.route("/preview", methods=["POST"])
@@ -930,6 +1434,7 @@ def preview():
     corr_ids = {int(x) for x in request.form.getlist("corr") if x.isdigit()}
     corr_none = request.form.get("corr_none") == "1"
     hide_merged = request.form.get("hide_merged") == "1"
+    use_ai = AI_ENABLED and request.form.get("use_ai") == "1"
 
     try:
         pl = Paperless()
@@ -956,13 +1461,16 @@ def preview():
         return index(error=f"Fehler bei der Abfrage von Paperless: {e}")
 
     plan = build_plan(invoices, deliveries, corr, start, hide_merged=hide_merged)
+    ai_stats = None
+    if use_ai:
+        plan, ai_stats = ai_enhance(invoices, deliveries, corr, start, hide_merged, plan)
     plan["groups"] = [g for g in plan["groups"] if g["inv"]["date"] <= end.isoformat()]
     plan["without"] = [g for g in plan["without"] if g["inv"]["date"] <= end.isoformat()]
 
     plan_id = uuid.uuid4().hex
     stored = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals,
               "extra_tags": [t["id"] for t in extra_tags],
-              "view": {"start": start, "end": end, "extra_tags": extra_tags,
+              "view": {"start": start, "end": end, "extra_tags": extra_tags, "ai_stats": ai_stats,
                        "sel_corrs": [corr.get(c, f"#{c}") for c in
                                      sorted(corr_ids, key=lambda c: corr.get(c, "").lower())]}}
     with PLANS_LOCK:
@@ -975,7 +1483,7 @@ def render_review(plan_id, stored, open_unassigned=False, info=None):
     return page(PREVIEW, plan=stored["plan"], plan_id=plan_id, start=v["start"], end=v["end"],
                 delete_originals=stored["delete_originals"], public=PAPERLESS_PUBLIC_URL, link=doc_link,
                 type_invoice=TYPE_INVOICE, extra_tags=v["extra_tags"], sel_corrs=v["sel_corrs"],
-                open_unassigned=open_unassigned, done_tag=DONE_TAG, info=info)
+                open_unassigned=open_unassigned, done_tag=DONE_TAG, info=info, ai_stats=v.get("ai_stats"))
 
 
 def _get_plan(plan_id):
@@ -1231,6 +1739,107 @@ def cleanup_titles():
         return page(CLEANUP, msg=f"Fehler bei der Abfrage von Paperless: {e}", errors=[])
     msg = f"{fixed} Titel bereinigt." if found else "Keine Dokumente mit „(merged)“ im Titel gefunden."
     return page(CLEANUP, msg=msg, errors=errors)
+
+
+@app.route("/ki/test")
+@require_auth
+def ki_test():
+    if not AI_ENABLED:
+        return page(CLEANUP, msg="KI-Unterstützung ist nicht eingerichtet (AI_API_KEY fehlt).", errors=[])
+    try:
+        AI(budget=1).test()
+        return page(CLEANUP, msg=f"✓ Verbindung zur KI erfolgreich – Anbieter {AI_BASE_URL}, Modell {AI_MODEL}.", errors=[])
+    except AIError as e:
+        return page(CLEANUP, msg=f"Verbindung zur KI fehlgeschlagen ({AI_BASE_URL}, Modell {AI_MODEL}).", errors=[str(e)])
+
+
+@app.route("/audit")
+@require_auth
+def audit(error=None):
+    today = dt.date.today()
+    return page(AUDIT_FORM, error=error, start=(today - dt.timedelta(days=365)).isoformat(), end=today.isoformat(),
+                max_docs=AUDIT_MAX_DOCS, merged_tag=MERGED_TAG)
+
+
+@app.route("/audit/start", methods=["POST"])
+@require_auth
+def audit_start():
+    _cleanup_audit_jobs()
+    try:
+        start = dt.date.fromisoformat(request.form["start"])
+        end = dt.date.fromisoformat(request.form["end"])
+    except (KeyError, ValueError):
+        return audit(error="Ungültige Datumsangabe.")
+    if end < start:
+        return audit(error="Das Enddatum liegt vor dem Startdatum.")
+    job_id = uuid.uuid4().hex
+    AUDIT_JOBS[job_id] = {"ts": time.time(), "status": "läuft", "done": 0, "total": 0, "results": [],
+                          "start": start.isoformat(), "end": end.isoformat(), "fixed": set(),
+                          "dir": tempfile.mkdtemp(prefix="pm-audit-")}
+    threading.Thread(target=_run_audit, args=(job_id, start, end), daemon=True).start()
+    return redirect(url_for("audit_job", job_id=job_id))
+
+
+@app.route("/audit/<job_id>")
+@require_auth
+def audit_job(job_id, info=None):
+    job = AUDIT_JOBS.get(job_id)
+    if not job:
+        return audit(error="Die Prüfung ist abgelaufen. Bitte neu starten.")
+    job["ts"] = time.time()
+    if job["status"] == "läuft":
+        return page(AUDIT_PROGRESS, job=job)
+    flagged = [e for e in job["results"] if e["issues"]]
+    dup_total = sum(len(e["dups"]) for e in job["results"])
+    return page(AUDIT_RESULT, job=job, job_id=job_id, flagged=flagged, dup_total=dup_total,
+                titles=job.get("titles", {}), fixed=job["fixed"], link=doc_link, public=PAPERLESS_PUBLIC_URL,
+                type_invoice=TYPE_INVOICE)
+
+
+@app.route("/audit/<job_id>/page/<int:doc_id>/<int:n>.png")
+@require_auth
+def audit_page(job_id, doc_id, n):
+    job = AUDIT_JOBS.get(job_id)
+    if not job:
+        abort(404)
+    png = os.path.join(job["dir"], f"{doc_id}-{n}.png")
+    if not os.path.exists(png):
+        src = os.path.join(job["dir"], f"{doc_id}.pdf")
+        if not os.path.exists(src):
+            abort(404)
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(src)
+        try:
+            if not 1 <= n <= len(pdf):
+                abort(404)
+            pg = pdf[n - 1]
+            pg.render(scale=260 / (pg.get_width() or 595)).to_pil().save(png, "PNG")
+        finally:
+            pdf.close()
+    with open(png, "rb") as f:
+        return Response(f.read(), content_type="image/png", headers={"Cache-Control": "max-age=3600"})
+
+
+@app.route("/audit/<job_id>/fix", methods=["POST"])
+@require_auth
+def audit_fix(job_id):
+    job = AUDIT_JOBS.get(job_id)
+    if not job or job["status"] != "fertig":
+        return audit(error="Die Prüfung ist abgelaufen. Bitte neu starten.")
+    pl = Paperless()
+    done, errors = [], []
+    for e in job["results"]:
+        pages = sorted({int(x) for x in request.form.getlist(f"del_{e['id']}") if x.isdigit()})
+        pages = [p for p in pages if 1 < p <= len(e["pages"])]
+        if not pages or e["id"] in job["fixed"]:
+            continue
+        try:
+            pl.remove_pages(e["id"], pages, len(e["pages"]))
+            job["fixed"].add(e["id"])
+            done.append({"title": e["title"], "count": len(pages), "pages": pages})
+        except Exception as ex:  # noqa: BLE001
+            errors.append(f"{e['title']}: {ex}")
+    return page(AUDIT_FIXED, done=done, errors=errors, job_id=job_id)
 
 
 def doc_link(doc_id):

@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.8** · [Änderungen](#versionen)
+**Aktuelle Version: 0.9** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -13,6 +13,8 @@ zu **einem PDF** zusammenführt:
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
 - **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
+- **Prüfung bereits zusammengeführter Rechnungen** auf doppelt enthaltene Lieferscheine – mit Seitenvorschau und Korrektur
+- optionale **KI-Unterstützung** (OpenAI, Mistral oder andere OpenAI-kompatible API) für schwer lesbare Dokumente
 
 Die Erweiterung läuft als eigener Docker-Container neben Paperless und arbeitet ausschließlich über
 die Paperless-API. Paperless selbst wird nicht verändert.
@@ -28,6 +30,8 @@ die Paperless-API. Paperless selbst wird nicht verändert.
   - [2. Prüfseite](#2-prüfseite)
   - [3. Zusammenführen und Ergebnis](#3-zusammenführen-und-ergebnis)
   - [4. Rechnungen zu Lieferscheinen suchen](#4-rechnungen-zu-lieferscheinen-suchen)
+  - [5. Zusammengeführte Rechnungen prüfen und korrigieren](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren)
+- [KI-Unterstützung](#ki-unterstützung)
 - [Was mit den Originalen passiert](#was-mit-den-originalen-passiert)
 - [Wie die Zuordnung funktioniert](#wie-die-zuordnung-funktioniert)
 - [Einstellungen](#einstellungen)
@@ -37,7 +41,7 @@ die Paperless-API. Paperless selbst wird nicht verändert.
 ---
 
 ## Voraussetzungen
-- Paperless-ngx (Version 2.x) mit den Dokumententypen **Rechnung** und **Lieferschein**
+- Paperless-ngx Version 2.x oder 3.x mit den Dokumententypen **Rechnung** und **Lieferschein**
   (andere Namen über `DOCTYPE_INVOICE` / `DOCTYPE_DELIVERY` einstellbar)
 - ein **API-Token**: in Paperless oben rechts auf das Profil → *API-Auth-Token*
 - der Benutzer, zu dem der Token gehört, braucht Rechte zum **Anzeigen, Ändern, Hinzufügen und Löschen** von Dokumenten
@@ -92,6 +96,7 @@ automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
 
 **Kopfzeile** (auf jeder Seite)
 - **⌂ Start** – zurück zur Startseite; ein Klick auf das Logo bzw. den Titel geht ebenfalls dorthin.
+- **🔎 Prüfen** – [zusammengeführte Rechnungen prüfen](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren).
 - **Paperless öffnen ↗** – öffnet die Paperless-Instanz in einem neuen Tab. Verwendet wird `PAPERLESS_PUBLIC_URL`,
   wenn gesetzt, sonst `PAPERLESS_URL`. Steht in `PAPERLESS_URL` ein Containername (z. B. `http://paperless:8000`),
   den der Browser nicht kennt, `PAPERLESS_PUBLIC_URL` mit der Adresse setzen, unter der Paperless im Browser aufgerufen wird.
@@ -106,6 +111,7 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 | Rechnungsdatum von / bis | Es werden Rechnungen mit Dokumentdatum in diesem Zeitraum gesucht. Vorbelegt: Anfang des Vormonats bis heute. |
 | Lieferscheine zusätzlich Tage vorher | Lieferscheine liegen meist vor der Rechnung. Hier wird festgelegt, wie viele Tage vor dem Startdatum noch Lieferscheine berücksichtigt werden (Standard 60). |
 | Originale in den Papierkorb verschieben | Siehe [Was mit den Originalen passiert](#was-mit-den-originalen-passiert). Standard: an. |
+| 🤖 KI-Unterstützung nutzen | Nur sichtbar, wenn die KI eingerichtet ist – siehe [KI-Unterstützung](#ki-unterstützung). Standard: an. *Verbindung testen* prüft Schlüssel und Modell. |
 | Bereits ergänzte Rechnungen ausblenden | Rechnungen, die schon mit Lieferscheinen zusammengeführt wurden, werden nicht erneut angeboten – siehe [Schutz vor doppeltem Zusammenführen](#schutz-vor-doppeltem-zusammenführen). Standard: an. |
 
 **Korrespondenten**
@@ -221,7 +227,65 @@ die schon einmal zusammengeführt wurden.
 - Danach geht es mit **← Zurück zur Prüfseite** weiter; die zugeordneten Lieferscheine sind dort entfernt.
   Wurde eine Rechnung verwendet, die auch auf der Prüfseite steht, muss die Prüfseite neu erstellt werden.
 
+### 5. Zusammengeführte Rechnungen prüfen und korrigieren
+Über **🔎 Prüfen** in der Kopfzeile lassen sich alle Rechnungen kontrollieren, die schon mit Lieferscheinen
+zusammengeführt wurden (Tag `LS-ergänzt` oder Paperless-Datei `…_merged.pdf` – auch direkt in Paperless
+zusammengeführte Dokumente).
+
+**Ablauf**
+1. Zeitraum (Rechnungsdatum) wählen und **Prüfung starten**. Jede PDF wird einmal aus Paperless geladen und Seite für
+   Seite untersucht; der Fortschritt wird angezeigt. Höchstens `AUDIT_MAX_DOCS` Dokumente je Prüfung (Standard 200, die neuesten zuerst).
+2. Das **Prüfergebnis** zeigt nur Dokumente mit Auffälligkeiten (*auch unauffällige Dokumente anzeigen* blendet alle ein).
+   Jede Seite erscheint als **Vorschaubild** mit den darauf erkannten Lieferscheinnummern.
+3. Seiten, die entfernt werden sollen, anhaken und **Markierte Seiten entfernen** – nach einer Sicherheitsabfrage.
+
+**Was erkannt wird**
+| Hinweis | Bedeutung | Vorauswahl „löschen“ |
+|---|---|---|
+| 🟥 **sicher doppelt** | Seitentext zu mindestens 95 % gleich wie eine frühere Seite – derselbe Lieferschein ist zweimal enthalten (auch bei zweimal eingescanntem Papier) | angehakt |
+| 🟧 **möglich** | Text zu 85–95 % ähnlich, oder Seite ohne Text, deren Bild einer früheren Seite nahezu gleicht | nicht angehakt – selbst ansehen |
+| **mehrfach** | dieselbe Lieferscheinnummer auf nicht zusammenhängenden Seiten desselben Dokuments | – (nur Hinweis) |
+| **auch woanders** | dieselbe Lieferscheinnummer steckt auch in einer **anderen** zusammengeführten Rechnung – mit Link und Seitenangabe | – (bei Bedarf die Seite im falschen Dokument anhaken) |
+
+Behalten wird immer das **erste** Vorkommen. Die **erste Seite** (Rechnung) kann nicht gelöscht werden, und es bleibt immer
+mindestens eine Seite übrig. Mehrseitige Lieferscheine (gleiche Nummer auf aufeinanderfolgenden Seiten) gelten nicht als doppelt.
+
+**Korrektur:** Paperless entfernt die Seiten und legt das bereinigte Dokument im Hintergrund neu an (bei Paperless 3.x als neue
+Version des Dokuments). Titel, Tags und alle anderen Angaben bleiben erhalten. Ein Dokument wird pro Prüfung nur einmal
+korrigiert und danach mit *korrigiert* gekennzeichnet – für eine Kontrolle die Prüfung nach kurzer Zeit neu starten.
+
 ---
+
+## KI-Unterstützung
+Optional kann eine KI bei schwer lesbaren Dokumenten helfen. Angebunden wird jede **OpenAI-kompatible API**,
+abgerechnet wird beim Anbieter nach verbrauchten Tokens. Fertig hinterlegt sind **OpenAI** und **Mistral**; über
+`AI_BASE_URL` lässt sich jeder andere kompatible Dienst oder ein lokales Modell (z. B. Ollama) eintragen.
+
+**Einrichten** (in der `docker-compose.yml`):
+```yaml
+      AI_PROVIDER: "mistral"              # oder "openai"
+      AI_API_KEY: "HIER_API_SCHLUESSEL"
+      # AI_MODEL: "mistral-small-latest"  # optional – Standard: mistral-small-latest bzw. gpt-4o-mini
+    volumes:
+      - ./data:/data                      # merkt sich KI-Ergebnisse, spart Tokens
+```
+Danach auf der Startseite **Verbindung testen** klicken.
+
+**Was die KI macht** (nur wenn auf der Startseite *KI-Unterstützung nutzen* angehakt ist):
+1. **Fehlende Nummern ergänzen:** Bei Lieferscheinen, in denen keine Nummer erkannt wurde, und bei Rechnungen ohne sicheren
+   Lieferschein liest die KI die Lieferscheinnummern aus dem Text. Diese Nummern sind auf der Prüfseite mit **KI** markiert
+   und werden ganz normal für die Zuordnung verwendet.
+2. **Unsichere Vorschläge prüfen:** Für jeden *unsicheren* Vorschlag (nur Korrespondent + Datum) vergleicht die KI Rechnung und
+   Lieferschein (Nummern, Positionen, Mengen, Datum). Ab 75 % Sicherheit wird der Vorschlag auf *sicher* gesetzt und angehakt,
+   bei „passt nicht“ ab 60 % abgewählt. Die Begründung steht beim Vorschlag (Kennzeichen **🤖 KI**).
+
+Oben auf der Prüfseite steht, wie viele Anfragen gestellt, Nummern ergänzt und Vorschläge geprüft wurden.
+
+**Kosten und Datenschutz**
+- Die KI wird nur dort gefragt, wo die normale Erkennung nicht weiterkommt – höchstens `AI_MAX_CALLS` Anfragen je Durchlauf (Standard 30).
+- An die KI geht nur der **OCR-Text** der betroffenen Dokumente, gekürzt auf `AI_MAX_CHARS` Zeichen (Standard 6000) – keine PDFs, keine Bilder.
+- Ergebnisse werden in `/data/ki-cache.json` gespeichert; dasselbe Dokument wird nicht erneut abgefragt.
+- Wer keine Daten nach außen geben möchte, trägt über `AI_BASE_URL` ein lokales Modell ein.
 
 ## Was mit den Originalen passiert
 | | Originale in den Papierkorb (Standard) | Originale behalten |
@@ -311,6 +375,16 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `SEARCH_DAYS_AFTER` | `365` | Suche zu Lieferscheinen: Tage nach dem Lieferscheindatum |
 | `SEARCH_UNLIMITED` | `false` | Suche zu Lieferscheinen: standardmäßig ohne Zeitbegrenzung |
 | `SEARCH_SAME_CORR` | `true` | Suche zu Lieferscheinen: standardmäßig nur beim gleichen Korrespondenten |
+| `AUDIT_MAX_DOCS` | `200` | Prüfung: höchstens so viele Dokumente je Prüfung |
+| `AI_PROVIDER` | `openai` | KI-Anbieter: `openai` oder `mistral` (setzt Adresse und Standardmodell) |
+| `AI_API_KEY` | leer | API-Schlüssel des Anbieters – ohne Schlüssel ist die KI aus |
+| `AI_MODEL` | je Anbieter | Modellname, Standard `gpt-4o-mini` (OpenAI) bzw. `mistral-small-latest` (Mistral) |
+| `AI_BASE_URL` | je Anbieter | eigene Adresse einer OpenAI-kompatiblen API, z. B. `http://192.168.1.60:11434/v1` für Ollama |
+| `AI_ENABLED` | – | `true` schaltet die KI auch ohne Schlüssel ein (für lokale Modelle) |
+| `AI_MAX_CALLS` | `30` | höchstens so viele KI-Anfragen je Durchlauf |
+| `AI_MAX_CHARS` | `6000` | so viele Zeichen Text je Dokument gehen an die KI |
+| `AI_TIMEOUT` | `60` | Zeitlimit je KI-Anfrage in Sekunden |
+| `AI_CACHE_FILE` | `/data/ki-cache.json` | Zwischenspeicher für KI-Ergebnisse |
 | `AUTO_CLEAN_TITLES` | `true` | „(merged)“ nach dem Zusammenführen automatisch aus den Titeln entfernen |
 | `APP_USER` / `APP_PASSWORD` | leer | optionaler Login für die Oberfläche (beide setzen) |
 | `TZ` | – | Zeitzone, z. B. `Europe/Berlin` |
@@ -327,11 +401,22 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | Neue Dokumente erscheinen nicht | Paperless verarbeitet im Hintergrund – kurz warten. Bei Problemen in Paperless unter *Dateiaufgaben* nachsehen. |
 | Lieferscheine werden nicht gefunden | Prüfen, ob die Nummer im OCR-Text (Paperless → Dokument → *Inhalt*) hinter einem der oben genannten Begriffe steht. Bessere Erkennung: mit 300 dpi scannen, `PAPERLESS_OCR_LANGUAGE: deu` setzen, Dokument in Paperless *erneut verarbeiten*. |
 | Vorschlag „abgelaufen“ | Vorschläge gelten eine Stunde und nur für einen Lauf – einfach neu suchen. |
+| *Verbindung zur KI fehlgeschlagen* – HTTP 401 | API-Schlüssel falsch oder nicht freigeschaltet. |
+| *Verbindung zur KI fehlgeschlagen* – HTTP 404 / Modell unbekannt | `AI_MODEL` prüfen – der Name muss genau so beim Anbieter existieren. |
+| *Höchstzahl an KI-Anfragen erreicht* | `AI_MAX_CALLS` erhöhen oder den Zeitraum verkleinern. |
+| Prüfung meldet *Konnte nicht geprüft werden* | Die PDF des Dokuments ließ sich nicht laden oder lesen – Dokument in Paperless öffnen und ggf. *erneut verarbeiten*. |
 | Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
 
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 0.9 (05.11.2026)
+- neue Funktion **Zusammengeführte Rechnungen prüfen** (Taste 🔎 Prüfen): erkennt doppelt enthaltene Seiten per Text- und Bildvergleich, dieselbe Lieferscheinnummer mehrfach im Dokument und in mehreren Rechnungen; Seitenvorschau aller Seiten
+- Korrektur direkt aus dem Prüfergebnis: markierte Seiten werden in Paperless entfernt (erste Seite geschützt)
+- optionale **KI-Unterstützung** über eine OpenAI-kompatible API (OpenAI, Mistral oder eigene Adresse): ergänzt fehlende Lieferscheinnummern und prüft unsichere Vorschläge; Anfragen-Begrenzung, Zwischenspeicher, Verbindungstest
+- Unterstützung der neuen Endpunkte von Paperless-ngx 3.x für Zusammenführen und Seitenbearbeitung, mit automatischem Rückfall für Paperless 2.x
+- neues Datenverzeichnis `/data` (Volume) für den KI-Zwischenspeicher
 
 ### Version 0.8 (03.11.2026)
 - Kopfzeile mit den Tasten **⌂ Start** (zurück zur Startseite) und **Paperless öffnen ↗** (öffnet die Paperless-Instanz in einem neuen Tab) auf jeder Seite
