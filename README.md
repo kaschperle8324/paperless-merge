@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 0.11** · [Änderungen](#versionen)
+**Aktuelle Version: 1.1** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
 zu **einem PDF** zusammenführt:
@@ -9,7 +9,8 @@ zu **einem PDF** zusammenführt:
 - das neue Dokument läuft als Dokumententyp **Rechnung**, übernimmt Korrespondent und Speicherpfad der Rechnung
   sowie **alle Tags der Rechnung und der zugehörigen Lieferscheine**
 - **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
-- **nichts wird doppelt zusammengeführt** – bearbeitete Rechnungen und Lieferscheine werden markiert und beim nächsten Lauf ausgeschlossen
+- **keine Duplikate** – nach jedem Durchlauf bleibt in Paperless jede Rechnung genau einmal übrig, mit jedem zugehörigen Lieferschein genau einmal darin
+- **Duplikat-Prüfung** – vorhandene Duplikate finden, ansehen und in den Papierkorb verschieben
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
 - **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
@@ -32,6 +33,7 @@ die Paperless-API. Paperless selbst wird nicht verändert.
   - [3. Zusammenführen und Ergebnis](#3-zusammenführen-und-ergebnis)
   - [4. Rechnungen zu Lieferscheinen suchen](#4-rechnungen-zu-lieferscheinen-suchen)
   - [5. Zusammengeführte Rechnungen prüfen und korrigieren](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren)
+  - [6. Duplikate prüfen und löschen](#6-duplikate-prüfen-und-löschen)
 - [KI-Unterstützung](#ki-unterstützung)
 - [Was mit den Originalen passiert](#was-mit-den-originalen-passiert)
 - [Wie die Zuordnung funktioniert](#wie-die-zuordnung-funktioniert)
@@ -125,6 +127,7 @@ automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
 **Kopfzeile** (auf jeder Seite)
 - **⌂ Start** – zurück zur Startseite; ein Klick auf das Logo bzw. den Titel geht ebenfalls dorthin.
 - **🔎 Prüfen** – [zusammengeführte Rechnungen prüfen](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren).
+- **🧹 Duplikate** – [Duplikate prüfen und löschen](#6-duplikate-prüfen-und-löschen).
 - **⚙ Einstellungen** – [KI-Zugänge einrichten](#ki-unterstützung).
 - **Paperless öffnen ↗** – öffnet die Paperless-Instanz in einem neuen Tab. Verwendet wird `PAPERLESS_PUBLIC_URL`,
   wenn gesetzt, sonst `PAPERLESS_URL`. Steht in `PAPERLESS_URL` ein Containername (z. B. `http://paperless:8000`),
@@ -140,7 +143,6 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 |---|---|
 | Rechnungsdatum von / bis | Es werden Rechnungen mit Dokumentdatum in diesem Zeitraum gesucht. Vorbelegt: Anfang des Vormonats bis heute. |
 | Lieferscheine zusätzlich Tage vorher | Lieferscheine liegen meist vor der Rechnung. Hier wird festgelegt, wie viele Tage vor dem Startdatum noch Lieferscheine berücksichtigt werden (Standard 60). |
-| Originale in den Papierkorb verschieben | Siehe [Was mit den Originalen passiert](#was-mit-den-originalen-passiert). Standard: an. |
 | 🤖 KI-Unterstützung nutzen | Nur sichtbar, wenn Texterkennung oder Auswertung unter **⚙ Einstellungen** eingerichtet ist – siehe [KI-Unterstützung](#ki-unterstützung). Standard: an. |
 | Bereits ergänzte Rechnungen ausblenden | Rechnungen, die schon mit Lieferscheinen zusammengeführt wurden, werden nicht erneut angeboten – siehe [Schutz vor doppeltem Zusammenführen](#schutz-vor-doppeltem-zusammenführen). Standard: an. |
 
@@ -167,7 +169,8 @@ kommt eine Sicherheitsabfrage.
 ### 2. Prüfseite
 Oben steht eine Übersicht: Zeitraum, Anzahl der Rechnungen **mit Vorschlag**, Rechnungen **ohne**
 gefundenen Lieferschein, **freie** Lieferscheine, ggf. **bereits ergänzte (ausgeblendete)** Rechnungen und
-**schon enthaltene** Lieferscheine, gewählte Korrespondenten, zusätzliche Tags und ob die Originale gelöscht werden.
+**schon enthaltene** Lieferscheine, gewählte Korrespondenten und zusätzliche Tags. Liegen in Paperless noch Originale, die schon
+in einer zusammengeführten Rechnung stecken, weist ein Hinweis darauf hin (Aufräumen über *🧹 Duplikate*).
 
 Darunter steht jede Rechnung als eigene Karte (auf breiten Bildschirmen mehrere nebeneinander):
 - **Vorschaubild** und Link **PDF ansehen** (bzw. *in Paperless öffnen*, wenn `PAPERLESS_PUBLIC_URL` gesetzt ist)
@@ -252,7 +255,7 @@ die schon einmal zusammengeführt wurden.
   sonst steht die Auswahl auf *nicht zuordnen*.
 - Vorgaben ändern und **Suchen** startet die Suche neu.
 - **Ausgewählte zusammenführen** führt jeden Lieferschein mit dem gewählten Dokument zusammen – nach denselben
-  Regeln wie oben: Rechnung zuerst, alle Tags, Originale wie auf der Startseite gewählt, „(merged)“ wird bereinigt.
+  Regeln wie oben: Rechnung zuerst, alle Tags, Originale in den Papierkorb, „(merged)“ wird bereinigt.
   Mehrere Lieferscheine zur selben Rechnung werden in einem Durchgang angehängt.
 - Danach geht es mit **← Zurück zur Prüfseite** weiter; die zugeordneten Lieferscheine sind dort entfernt.
   Wurde eine Rechnung verwendet, die auch auf der Prüfseite steht, muss die Prüfseite neu erstellt werden.
@@ -287,6 +290,28 @@ Version des Dokuments). Titel, Tags und alle anderen Angaben bleiben erhalten. E
 korrigiert und danach mit *korrigiert* gekennzeichnet – für eine Kontrolle die Prüfung nach kurzer Zeit neu starten.
 
 ---
+
+### 6. Duplikate prüfen und löschen
+Über **🧹 Duplikate** in der Kopfzeile lässt sich der Bestand in Paperless auf Duplikate prüfen – z. B. Reste aus
+früheren Läufen oder doppelt eingescannte Belege.
+
+1. Zeitraum (Dokumentdatum) und Dokumententypen wählen (vorausgewählt: *Rechnung* und *Lieferschein*) und
+   **Duplikate suchen** – es wird noch nichts gelöscht.
+2. Das Ergebnis zeigt je Fall **links das Dokument, das bleibt**, rechts die Duplikate – jeweils mit Vorschaubild,
+   Datum, Korrespondent, Seitenzahl, ID und Link zum Ansehen.
+3. Duplikate anhaken und **Markierte Duplikate löschen** – nach einer Sicherheitsabfrage wandern sie in den
+   **Paperless-Papierkorb** (dort wiederherstellbar).
+
+| Fall | Erkennung | bleibt | Vorauswahl |
+|---|---|---|---|
+| **Original noch vorhanden** | Rechnung oder Lieferschein steckt zu ≥ 80 % in einer zusammengeführten Rechnung | die zusammengeführte Rechnung | ab 90 % angehakt |
+| **Rechnung doppelt zusammengeführt** | zwei zusammengeführte Fassungen sind gleich (≥ 90 %) oder die kleinere steckt in der größeren | die vollständigere Fassung | angehakt |
+| **doppeltes Dokument** | zwei Dokumente desselben Typs mit ≥ 90 % gleichem Inhalt (z. B. doppelter Scan) | mehr Seiten, sonst mehr Tags, sonst das ältere | ab 95 % angehakt |
+| **teilweise gleich – bitte prüfen** | zwei zusammengeführte Rechnungen mit derselben Rechnung, aber unterschiedlichen Lieferscheinen | – | nicht angehakt |
+
+Verglichen wird der **Text** der Dokumente (Wortgruppen), unabhängig von Zeilenumbrüchen und typischen OCR-Fehlern.
+Gemeinsame Briefköpfe, Bankverbindungen oder AGB zählen nicht als Übereinstimmung. Bei unterschiedlichen
+Korrespondenten wird nie etwas vorausgewählt. Ein Dokument, das bleiben soll, kann nicht gelöscht werden.
 
 ## KI-Unterstützung
 Optional können zwei KI-Dienste helfen – unabhängig voneinander, einzeln oder kombiniert:
@@ -336,12 +361,14 @@ Oben auf der Prüfseite steht, wie viele Dokumente neu erkannt, Nummern ergänzt
   (*eigene Adresse*, z. B. `http://192.168.1.60:11434/v1`).
 
 ## Was mit den Originalen passiert
-| | Originale in den Papierkorb (Standard) | Originale behalten |
-|---|---|---|
-| Rechnung + Lieferscheine | wandern in den **Paperless-Papierkorb** und sind dort wiederherstellbar | bleiben unverändert erhalten |
-| Lieferscheine | bekommen das Tag **`LS-zugeordnet`** (auch im Papierkorb – wichtig, falls sie wiederhergestellt werden) | bekommen das Tag **`LS-zugeordnet`** |
-| Rechnung | neues Dokument bekommt das Tag **`LS-ergänzt`** | neues Dokument **und** Original-Rechnung bekommen das Tag **`LS-ergänzt`** |
-| Tags von Lieferscheinen und Zusatz-Tags | am neuen Dokument | am neuen Dokument – die Original-Rechnung behält nur ihre eigenen Tags |
+Nach jedem Zusammenführen – egal ob von der Prüfseite oder aus der Lieferschein-Suche – bleibt in Paperless
+**nur das neue Dokument** übrig: die Rechnung mit allen zugehörigen Lieferscheinen, jeder genau einmal.
+
+| | danach |
+|---|---|
+| Original-Rechnung und -Lieferscheine | wandern in den **Paperless-Papierkorb** (dort wiederherstellbar). Paperless löscht sie erst, wenn das neue Dokument erfolgreich angelegt wurde. |
+| Lieferscheine | bekommen vorher das Tag **`LS-zugeordnet`** – werden sie aus dem Papierkorb wiederhergestellt, werden sie trotzdem nicht erneut verwendet |
+| neues Dokument | Typ *Rechnung*, Titel, Datum, Korrespondent, Speicherpfad und ASN der Rechnung, alle Tags (siehe unten) und das Tag **`LS-ergänzt`** |
 
 ### Tags des neuen Dokuments
 Das zusammengeführte Dokument bekommt **alle Tags zusammen**:
@@ -351,10 +378,7 @@ Das zusammengeführte Dokument bekommt **alle Tags zusammen**:
 
 Dazu kommt das Tag `LS-ergänzt` (siehe unten). Doppelte Tags werden nur einmal gesetzt. Das Tag `LS-zugeordnet` wird nie übernommen.
 Technisch werden die Tags kurz vor dem Zusammenführen an die Rechnung gehängt, weil Paperless die
-Metadaten des neuen Dokuments von der Rechnung übernimmt. Bleiben die Originale erhalten, werden diese
-Tags danach an der Original-Rechnung wieder entfernt.
-
-Für den ersten Lauf empfiehlt es sich, die Originale zu **behalten** und einen kurzen Zeitraum zu wählen.
+Metadaten des neuen Dokuments von der Rechnung übernimmt.
 
 ### Schutz vor doppeltem Zusammenführen
 Damit eine Rechnung nicht bei jedem Lauf erneut mit ihren Lieferscheinen zusammengeführt wird, werden beim
@@ -363,11 +387,15 @@ Zusammenführen **immer** zwei Tags gesetzt (beide werden bei Bedarf automatisch
 | Tag | an | Wirkung beim nächsten Lauf |
 |---|---|---|
 | `LS-zugeordnet` | jedem verwendeten Lieferschein | Lieferschein wird nicht mehr gesucht |
-| `LS-ergänzt` | der neuen Rechnung (und einer erhaltenen Original-Rechnung) | Rechnung wird ausgeblendet |
+| `LS-ergänzt` | der neuen Rechnung | Rechnung wird ausgeblendet |
 
 Zusätzlich erkennt die Erweiterung auch **ältere** zusammengeführte Rechnungen ohne Tag – Paperless legt das
 zusammengeführte PDF immer mit dem Dateinamen `…_merged.pdf` an. Das gilt auch für Dokumente, die direkt in
 Paperless zusammengeführt wurden.
+
+Außerdem wird der **Inhalt** verglichen: Eine Rechnung oder ein Lieferschein, dessen Text schon in einer
+zusammengeführten Rechnung steckt (z. B. ein übrig gebliebenes Original), wird nicht erneut angeboten – auch ohne
+Tag und ohne erkannte Nummer. Die Prüfseite weist dann auf *🧹 Duplikate* zum Aufräumen hin.
 
 Ausgeblendete Rechnungen werden trotzdem für die Zuordnung verwendet: Steht die Nummer eines Lieferscheins in
 einer schon ergänzten Rechnung, wird dieser Lieferschein keiner anderen Rechnung zugeschlagen, sondern als
@@ -424,6 +452,7 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `SEARCH_UNLIMITED` | `false` | Suche zu Lieferscheinen: standardmäßig ohne Zeitbegrenzung |
 | `SEARCH_SAME_CORR` | `true` | Suche zu Lieferscheinen: standardmäßig nur beim gleichen Korrespondenten |
 | `AUDIT_MAX_DOCS` | `200` | Prüfung: höchstens so viele Dokumente je Prüfung |
+| `DUP_MAX_DOCS` | `3000` | Duplikat-Prüfung: höchstens so viele Dokumente je Suche |
 | `DATA_DIR` | `/data` | Datenverzeichnis für Einstellungen und Zwischenspeicher (als Volume einbinden) |
 
 Die folgenden KI-Variablen sind **optional** – die Zugänge werden normalerweise unter **⚙ Einstellungen** gepflegt.
@@ -472,11 +501,18 @@ Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorra
 | Passwort vergessen | `benutzer.json` im Datenverzeichnis löschen und die Seite neu aufrufen – dann einen neuen Zugang anlegen. |
 | *Zu viele Fehlversuche* | 10 Minuten warten. |
 | Nach jedem Neustart abgemeldet | Das Volume `./data:/data` fehlt – dann wird der Sitzungsschlüssel nicht gespeichert. |
+| Duplikate aus früheren Versionen (Original und zusammengeführte Fassung) | Mit **🧹 Duplikate** suchen und löschen. Seit Version 1.1 entstehen keine neuen mehr. |
 | Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
 
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 1.1 (05.11.2026)
+- **keine Duplikate mehr:** nach jedem Zusammenführen bleibt in Paperless je Rechnung genau ein Dokument übrig – die Originale gehen immer in den Papierkorb; die Option *Originale behalten* (Ursache der bisherigen Duplikate) entfällt
+- Rechnungen und Lieferscheine, deren Inhalt schon in einer zusammengeführten Rechnung steckt, werden nicht erneut angeboten (Inhaltsvergleich zusätzlich zu Tags und Dateinamen)
+- neue Funktion **🧹 Duplikate**: Bestand auf Duplikate prüfen (Originale neben zusammengeführten Rechnungen, doppelt zusammengeführte Rechnungen, doppelte Scans), nebeneinander ansehen und in den Papierkorb verschieben
+- Löschen über die Paperless-API in den Papierkorb (Paperless 2.x und 3.x)
 
 ### Version 0.11 (05.11.2026)
 - **Anmeldung** für die Oberfläche: beim ersten Aufruf Fenster zum Anlegen von Benutzer und Passwort, danach Anmeldeseite mit *angemeldet bleiben*

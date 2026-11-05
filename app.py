@@ -119,6 +119,13 @@ class Paperless:
                 raise
         return self.send("POST", "/api/documents/bulk_edit/", legacy_payload)
 
+    def delete_docs(self, doc_ids):
+        """Verschiebt Dokumente in den Papierkorb (in Paperless wiederherstellbar)."""
+        return self._send_new_or_legacy(
+            "/api/documents/delete/", {"documents": list(doc_ids)},
+            {"documents": list(doc_ids), "method": "delete", "parameters": {}},
+        )
+
     def download(self, doc_id, original=False):
         """PDF eines Dokuments (Archivversion mit Textebene, wenn vorhanden)."""
         r = self.s.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/",
@@ -1015,6 +1022,177 @@ def _cleanup_audit_jobs(ttl=3 * 3600):
         AUDIT_JOBS.pop(k, None)
 
 
+# --------------------------------------------------------------------------- Duplikate
+DUP_MAX_DOCS = int(os.environ.get("DUP_MAX_DOCS", "3000"))
+_WORD_RE = re.compile(r"[A-Z0-9ÄÖÜß]{2,}")
+
+
+def shingles(text, n=5):
+    """Wortgruppen (n Wörter) eines Textes als Menge von Hashes – unempfindlich gegen Zeilenumbrüche/Abstände."""
+    words = _WORD_RE.findall(ocr_norm(text or ""))
+    if len(words) < n:
+        return {hash(" ".join(words))} if words else set()
+    return {hash(" ".join(words[i:i + n])) for i in range(len(words) - n + 1)}
+
+
+def containment(a, b):
+    """Anteil von a, der in b enthalten ist (0..1)."""
+    return len(a & b) / len(a) if a else 0.0
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if a and b else 0.0
+
+
+def find_duplicates(docs, merged_ids, type_names, corr):
+    """Findet Duplikate. Rückgabe: Liste von Funden {keep, drop:[{doc, reason, score, sure}], kind}."""
+    sh = {d["id"]: shingles(f"{d.get('content', '')}") for d in docs}
+    by_id = {d["id"]: d for d in docs}
+    index = {}
+    for did, s in sh.items():
+        for h in s:
+            index.setdefault(h, []).append(did)
+    # Kandidatenpaare über gemeinsame Wortgruppen finden (statt alle Paare zu vergleichen)
+    pairs = {}
+    for ids in index.values():
+        if len(ids) > 60:  # Allerweltsfloskeln (Briefkopf, AGB) überspringen
+            continue
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                k = (ids[i], ids[j]) if ids[i] < ids[j] else (ids[j], ids[i])
+                pairs[k] = pairs.get(k, 0) + 1
+    raw = []
+    for (a, b), shared in pairs.items():
+        if shared < 3:
+            continue
+        sa, sb = sh[a], sh[b]
+        da, db = by_id[a], by_id[b]
+        ca, cb = da.get("correspondent"), db.get("correspondent")
+        corr_conflict = ca is not None and cb is not None and ca != cb
+        am, bm = a in merged_ids, b in merged_ids
+        cont_ab, cont_ba, jac = containment(sa, sb), containment(sb, sa), jaccard(sa, sb)
+        if am != bm:  # Original vs. zusammengeführtes Dokument
+            orig, mer, c = (a, b, cont_ab) if not am else (b, a, cont_ba)
+            if c >= 0.8:
+                kind = "Original noch vorhanden"
+                reason = (f"{type_names.get(by_id[orig].get('document_type'), 'Dokument')} steckt zu {round(c * 100)} % "
+                          f"in der zusammengeführten Rechnung")
+                raw.append((c, mer, orig, kind, reason, c >= 0.9 and not corr_conflict))
+        elif am and bm:  # zwei zusammengeführte Rechnungen
+            if jac >= 0.9:
+                keep, drop = _prefer(da, db)
+                raw.append((jac, keep["id"], drop["id"], "Rechnung doppelt zusammengeführt",
+                            f"beide Fassungen zu {round(jac * 100)} % gleich", not corr_conflict))
+            elif max(cont_ab, cont_ba) >= 0.9:
+                small, big = (a, b) if cont_ab >= cont_ba else (b, a)
+                c = max(cont_ab, cont_ba)
+                raw.append((c, big, small, "Rechnung doppelt zusammengeführt",
+                            f"kleinere Fassung steckt zu {round(c * 100)} % in der größeren", not corr_conflict))
+            elif min(len(sa), len(sb)) and max(cont_ab, cont_ba) >= 0.5 and not corr_conflict:
+                keep, drop = _prefer(da, db)
+                raw.append((max(cont_ab, cont_ba), keep["id"], drop["id"], "teilweise gleich – bitte prüfen",
+                            f"zu {round(max(cont_ab, cont_ba) * 100)} % gleich, enthalten aber verschiedene Seiten",
+                            False))
+        else:  # zwei normale Dokumente
+            same_type = da.get("document_type") == db.get("document_type")
+            if jac >= 0.9 and same_type:
+                keep, drop = _prefer(da, db)
+                raw.append((jac, keep["id"], drop["id"], "doppeltes Dokument",
+                            f"Inhalt zu {round(jac * 100)} % gleich", jac >= 0.95 and not corr_conflict))
+    # Entscheidungen: beste zuerst; ein Dokument wird höchstens einmal zum Löschen vorgeschlagen und
+    # ein zu behaltendes Dokument nie gelöscht
+    raw.sort(key=lambda r: -r[0])
+    dropped, kept, findings = set(), set(), {}
+    for score, keep, drop, kind, reason, sure in raw:
+        if drop in dropped or drop in kept or keep in dropped:
+            continue
+        dropped.add(drop)
+        kept.add(keep)
+        f = findings.setdefault(keep, {"keep": keep, "drop": []})
+        f["drop"].append({"id": drop, "kind": kind, "reason": reason, "score": round(score * 100), "sure": sure})
+    out = []
+    for f in findings.values():
+        f["drop"].sort(key=lambda x: -x["score"])
+        out.append(f)
+    out.sort(key=lambda f: str(by_id[f["keep"]].get("created")), reverse=True)
+    return out
+
+
+def _prefer(a, b):
+    """Welches von zwei gleichen Dokumenten bleibt: mehr Seiten, sonst mehr Tags, sonst das ältere (kleinere ID)."""
+    key = lambda d: (d.get("page_count") or 0, len(d.get("tags") or []), -d["id"])  # noqa: E731
+    return (a, b) if key(a) >= key(b) else (b, a)
+
+
+def mark_already_merged(invoices, deliveries, threshold=0.8):
+    """Markiert Rechnungen und Lieferscheine, deren Inhalt schon in einer zusammengeführten Rechnung steckt.
+    Rechnungen gelten dann als bereits ergänzt (werden nicht erneut angeboten). Rückgabe: (anzahl, {ls_id: (ls, rechnung)})."""
+    merged = [i for i in invoices if i.get("_merged")]
+    if not merged:
+        return 0, {}
+    msh = {m["id"]: shingles(m.get("content")) for m in merged}
+
+    def owner(doc):
+        s = shingles(doc.get("content"))
+        if len(s) < 8:  # zu wenig Text für einen sicheren Vergleich
+            return None
+        for m in merged:
+            if m["id"] == doc["id"]:
+                continue
+            if doc.get("correspondent") and m.get("correspondent") and doc["correspondent"] != m["correspondent"]:
+                continue
+            if containment(s, msh[m["id"]]) >= threshold:
+                return m["id"]
+        return None
+    count = 0
+    for inv in invoices:
+        if not inv.get("_merged") and owner(inv):
+            inv["_merged"] = True
+            count += 1
+    ls_dups = {}
+    for ls in deliveries:
+        o = owner(ls)
+        if o:
+            ls_dups[ls["id"]] = (ls, o)
+    return count, ls_dups
+
+
+def _run_dups(job_id, start, end, type_ids):
+    job = AUDIT_JOBS[job_id]
+    try:
+        pl = Paperless()
+        types = {t["id"]: t["name"] for t in pl.doc_types()}
+        merged_tag = pl.id_by_name("/api/tags/", MERGED_TAG)
+        corr = pl.correspondents()
+        job["phase"] = "Dokumente laden"
+        docs = pl.find_docs(type_ids, start, end)
+        if len(docs) > DUP_MAX_DOCS:
+            job["truncated"] = len(docs)
+            docs = sorted(docs, key=lambda d: str(d.get("created")), reverse=True)[:DUP_MAX_DOCS]
+        job["total"] = len(docs)
+        job["phase"] = "vergleichen"
+        merged_ids = {d["id"] for d in docs if is_merged_doc(d, merged_tag)}
+        findings = find_duplicates(docs, merged_ids, types, corr)
+        by_id = {d["id"]: d for d in docs}
+
+        def info(did):
+            d = by_id[did]
+            return {**summarize(d, corr), "type": types.get(d.get("document_type"), "–"),
+                    "pages": d.get("page_count"), "merged": did in merged_ids,
+                    "tag_count": len(d.get("tags") or [])}
+        for f in findings:
+            f["keep_doc"] = info(f["keep"])
+            for x in f["drop"]:
+                x["doc"] = info(x["id"])
+        job["done"] = len(docs)
+        job["findings"] = findings
+        job["checked"] = len(docs)
+        job["status"] = "fertig"
+    except Exception as e:  # noqa: BLE001
+        job["status"] = "fehler"
+        job["error"] = str(e)[:300]
+
+
 # --------------------------------------------------------------------------- Suche nach Rechnungen zu Lieferscheinen
 def search_variants(num):
     """Suchbegriffe für die Textsuche in Paperless: Nummer, OCR-Form und die letzten 5 Ziffern."""
@@ -1263,6 +1441,14 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.dupcase{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:18px}
+@media (max-width:800px){.dupcase{grid-template-columns:1fr}}
+.dupcol.keep{border-right:1px solid var(--line);padding-right:14px}
+@media (max-width:800px){.dupcol.keep{border-right:0;padding-right:0;border-bottom:1px solid var(--line);padding-bottom:12px}}
+.duprow{display:flex;gap:12px;align-items:flex-start;padding:10px;border-radius:10px;cursor:pointer}
+.duprow:hover{background:var(--surface2)}
+.duprow.gone{opacity:.5}
+.dc{display:flex;gap:12px;align-items:center;margin-top:8px}
 .authbox{max-width:440px;margin:6vh auto 0}
 .authbox h3{font-size:1.25rem}
 .authbox input{margin-bottom:12px}
@@ -1300,6 +1486,7 @@ ul{padding-left:18px}
 <header><a href="{{ url_for('index') }}" class="home"><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></a>
 <nav class="hnav">{% if show_nav %}<a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
 <a class="hbtn" href="{{ url_for('audit') }}">🔎 Prüfen</a>
+<a class="hbtn" href="{{ url_for('dups') }}">🧹 Duplikate</a>
 <a class="hbtn" href="{{ url_for('settings') }}">⚙ Einstellungen</a>
 {% if paperless_link %}<a class="hbtn" href="{{ paperless_link }}" target="_blank" rel="noopener">Paperless öffnen ↗</a>{% endif %}
 {% if current_user %}<a class="hbtn" href="{{ url_for('logout') }}" title="Abmelden">👤 {{ current_user }} · Abmelden</a>{% endif %}{% endif %}
@@ -1328,9 +1515,8 @@ INDEX = """
      <div><label class="f">Lieferscheine zusätzlich Tage vorher</label>
        <input type="number" name="lookback" value="{{ lookback }}" min="0" max="365"></div>
    </div>
-   <label class="switch"><input type="checkbox" name="delete_originals" value="1" checked>
-     Originale nach dem Zusammenführen in den Papierkorb verschieben</label>
-   <p class="meta">Ohne Haken bleiben die Originale erhalten.</p>
+   <p class="meta">Nach dem Zusammenführen bleibt in Paperless nur das neue Dokument übrig – Rechnung und Lieferscheine
+     wandern in den Papierkorb (dort wiederherstellbar). So entstehen keine Duplikate.</p>
    <label class="switch"><input type="checkbox" name="hide_merged" value="1" checked>
      Bereits ergänzte Rechnungen ausblenden</label>
    {% if ai.enabled or ocr.enabled %}<label class="switch"><input type="checkbox" name="use_ai" value="1" checked>
@@ -1407,7 +1593,12 @@ PREVIEW = """
     {% if plan.hidden %}<div class="stat"><b>{{ plan.hidden }}</b><span class="meta">bereits ergänzt (ausgeblendet)</span></div>{% endif %}
     {% if plan.contained %}<div class="stat"><b>{{ plan.contained|length }}</b><span class="meta">LS schon enthalten</span></div>{% endif %}
   </div>
-  Originale: <b>{{ "werden in den Papierkorb verschoben" if delete_originals else "bleiben erhalten" }}</b><br>
+  {% if plan.orig_dups or plan.contained %}<p class="meta">⚠ In Paperless liegen noch Originale, die schon in einer zusammengeführten
+    Rechnung stecken ({{ plan.orig_dups }} Rechnung(en), {{ plan.contained|length }} Lieferschein(e)). Sie werden nicht erneut
+    zusammengeführt. Aufräumen über <a href="{{ url_for('dups') }}">🧹 Duplikate</a>.</p>{% endif %}
+  <div>
+  </div>
+  Originale: <b>werden nach dem Zusammenführen in den Papierkorb verschoben</b><br>
   Korrespondenten: {% for c in sel_corrs %}<span class="pill tag">{{ c }}</span>{% else %}<span class="meta">alle</span>{% endfor %}<br>
   Zusätzliche Tags: {% for t in extra_tags %}<span class="pill" style="background:{{ t.color or '#6366f1' }};color:{{ t.text_color or '#fff' }}">{{ t.name }}</span>{% else %}<span class="meta">keine</span>{% endfor %}
   <p class="meta">Reihenfolge im neuen PDF: Rechnung zuerst, danach die Lieferscheine nach Datum.
@@ -1591,7 +1782,7 @@ SEARCH = """
 </div>
 {% endfor %}
 </div>
-<div class="card bar"><span class="meta">Rechnung zuerst, danach die Lieferscheine – Tags und Originale wie auf der Startseite gewählt.</span>
+<div class="card bar"><span class="meta">Rechnung zuerst, danach die Lieferscheine – Tags wie auf der Startseite gewählt, Originale in den Papierkorb.</span>
   <button type="submit">Ausgewählte zusammenführen</button></div>
 </form>
 <script>
@@ -1625,8 +1816,8 @@ AUDIT_FORM = """
 
 AUDIT_PROGRESS = """
 <meta http-equiv="refresh" content="2">
-<div class="card"><h3>🔎 Prüfung läuft …</h3>
-  <p>{{ job.done }} von {{ job.total if job.total else '?' }} Dokumenten geprüft.</p>
+<div class="card"><h3>{{ title or '🔎 Prüfung läuft …' }}</h3>
+  <p>{% if job.phase %}{{ job.phase }} · {% endif %}{{ job.done }} von {{ job.total if job.total else '?' }} Dokumenten geprüft.</p>
   <div style="height:10px;border-radius:99px;background:var(--surface2);overflow:hidden">
     <div style="height:100%;width:{{ (100 * job.done / job.total) if job.total else 3 }}%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div>
   <p class="meta">Die Seite aktualisiert sich automatisch.</p></div>
@@ -1815,6 +2006,82 @@ LOGIN = """
 </form>
 """
 
+DUPS_FORM = """
+{% if error %}<div class="card err">{{ error }}</div>{% endif %}
+<form class="card" method="post" action="{{ url_for('dups_start') }}">
+  <h3>🧹 Duplikate prüfen</h3>
+  <p class="meta" style="margin-top:0">Sucht Dokumente, die doppelt in Paperless liegen – z. B. Original-Rechnungen und
+    -Lieferscheine, die schon in einer zusammengeführten Rechnung stecken, doppelt zusammengeführte Rechnungen oder
+    doppelt eingescannte Dokumente. Verglichen wird der Text der Dokumente. Es wird noch nichts gelöscht.</p>
+  <div class="grid2">
+    <div><label class="f">Dokumentdatum von</label><input type="date" name="start" value="{{ start }}" required></div>
+    <div><label class="f">Dokumentdatum bis</label><input type="date" name="end" value="{{ end }}" required></div>
+  </div>
+  <label class="f" style="margin-top:14px">Dokumententypen</label>
+  <div class="chips">{% for t in types %}<label class="chip plain"><input type="checkbox" name="type" value="{{ t.id }}"
+    {{ 'checked' if t.id in sel }}><span>{{ t.name }}</span></label>{% endfor %}</div>
+  <div style="margin-top:18px"><button>Duplikate suchen</button></div>
+</form>
+"""
+
+DUPS_RESULT = """
+{% if job.status == 'fehler' %}<div class="card err">Fehler: {{ job.error }}</div>{% endif %}
+{% if info %}<div class="card ok">{{ info }}</div>{% endif %}
+<form method="post" action="{{ url_for('dups_delete', job_id=job_id) }}" id="df">
+<div class="card"><h3>🧹 Duplikate</h3>
+  <div class="meta">Zeitraum {{ job.start|de }} – {{ job.end|de }}</div>
+  <div class="stats">
+    <div class="stat"><b>{{ job.checked }}</b><span class="meta">Dokumente verglichen</span></div>
+    <div class="stat"><b>{{ job.findings|length }}</b><span class="meta">Fälle</span></div>
+    <div class="stat"><b>{{ total_drop }}</b><span class="meta">mögliche Duplikate</span></div>
+  </div>
+  {% if job.truncated %}<p class="meta">Achtung: {{ job.truncated }} Dokumente gefunden, verglichen wurden die neuesten {{ job.checked }}.</p>{% endif %}
+  <p class="meta">Links steht jeweils das Dokument, das <b>bleibt</b>, rechts die Duplikate. <span class="badge unsicher">sicher</span>
+    = zum Löschen vorausgewählt, <span class="badge mittel">prüfen</span> = bitte selbst ansehen. Gelöschte Dokumente landen
+    im Paperless-Papierkorb und lassen sich dort wiederherstellen.</p>
+</div>
+{% if not job.findings %}<div class="card ok">Keine Duplikate gefunden.</div>{% endif %}
+{% for f in job.findings %}
+<div class="card dupcase">
+  <div class="dupcol keep">
+    <div class="meta" style="font-weight:700;color:var(--ok)">✓ bleibt</div>
+    {{ doccard(f.keep_doc) }}
+  </div>
+  <div class="dupcol">
+    {% for x in f.drop %}
+    <label class="duprow {{ 'gone' if x.id in deleted }}">
+      {% if x.id in deleted %}<span class="badge sicher">gelöscht</span>{% else %}
+      <input type="checkbox" name="del" value="{{ x.id }}" class="deld" {{ 'checked' if x.sure }}>{% endif %}
+      <div style="flex:1;min-width:0">
+        <span class="badge {{ 'unsicher' if x.sure else 'mittel' }}">{{ 'sicher' if x.sure else 'prüfen' }}</span>
+        <b>{{ x.kind }}</b> <span class="meta">– {{ x.reason }}</span>
+        {{ doccard(x.doc) }}
+      </div>
+    </label>
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+<div class="card bar"><a class="btn sec" href="{{ url_for('dups') }}">← Neue Suche</a>
+  <button type="submit">Markierte Duplikate löschen</button></div>
+</form>
+<script>
+document.getElementById('df').addEventListener('submit', e => {
+  const n = document.querySelectorAll('.deld:checked').length;
+  if (!n) { alert('Nichts markiert.'); e.preventDefault(); return; }
+  if (!confirm(n + ' Dokument(e) in den Paperless-Papierkorb verschieben?')) e.preventDefault();
+});
+</script>
+"""
+
+DOCCARD = """{% macro doccard(d) %}<div class="dc">
+  <a href="{{ link(d.id) }}" target="_blank"><img class="th" loading="lazy" src="{{ url_for('thumb', doc_id=d.id) }}"></a>
+  <div style="min-width:0"><span class="tag">{{ d.type }}</span>{% if d.merged %} <span class="ai">zusammengeführt</span>{% endif %}
+    <b>{{ d.title }}</b><br>
+    <span class="meta">{{ d.date|de }} · {{ d.correspondent }}{% if d.pages %} · {{ d.pages }} S.{% endif %}{% if d.asn %} · ASN {{ d.asn }}{% endif %}
+      · ID {{ d.id }} · <a href="{{ link(d.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span></div>
+</div>{% endmacro %}"""
+
 RESULT = """
 <div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Ergebnis</h3>
   {{ done|length }} Zusammenführung(en) an Paperless übergeben{% if errors %}, {{ errors|length }} Fehler{% endif %}.
@@ -1891,7 +2158,7 @@ def preview():
         return index(error="Ungültige Datumsangabe.")
     if end < start:
         return index(error="Das Enddatum liegt vor dem Startdatum.")
-    delete_originals = request.form.get("delete_originals") == "1"
+    delete_originals = True  # immer: nach dem Zusammenführen darf nur das neue Dokument übrig bleiben
     corr_ids = {int(x) for x in request.form.getlist("corr") if x.isdigit()}
     corr_none = request.form.get("corr_none") == "1"
     hide_merged = request.form.get("hide_merged") == "1"
@@ -1916,12 +2183,19 @@ def preview():
         merged_tag = pl.id_by_name("/api/tags/", MERGED_TAG)
         for d in invoices:
             d["_merged"] = is_merged_doc(d, merged_tag)
+        orig_dups, ls_dups = mark_already_merged(invoices, deliveries)
         wanted = {int(x) for x in request.form.getlist("tags") if x.isdigit()}
         extra_tags = [t for t in pl.tags() if t["id"] in wanted] if wanted else []
     except Exception as e:  # noqa: BLE001
         return index(error=f"Fehler bei der Abfrage von Paperless: {e}")
 
+    deliveries = [d for d in deliveries if d["id"] not in ls_dups]
     plan = build_plan(invoices, deliveries, corr, start, hide_merged=hide_merged)
+    inv_by_id = {i["id"]: i for i in invoices}
+    for lid, (ls_doc, inv_id) in ls_dups.items():
+        plan["contained"].append({**summarize(ls_doc, corr), "in_inv": summarize(inv_by_id[inv_id], corr), "match": None,
+                                  "nums": [{"n": x, "hit": False, "ai": ""} for x in sorted(delivery_numbers(ls_doc))]})
+    plan["orig_dups"] = orig_dups
     ai_stats = None
     if use_ai:
         plan, ai_stats = ai_enhance(invoices, deliveries, corr, start, hide_merged, plan)
@@ -2104,6 +2378,8 @@ def search_merge():
 
 def perform_merges(jobs, known_ls, delete_originals, extra):
     """Führt die Zusammenführungen aus. jobs: [(rechnung_summary, [lieferschein_ids])].
+    Die Originale (Rechnung und Lieferscheine) gehen immer in den Papierkorb – in Paperless bleibt je Rechnung
+    genau ein Dokument übrig. delete_originals wird nur noch aus Kompatibilitätsgründen angenommen.
 
     Markierung, damit nichts doppelt zusammengeführt wird:
       - Lieferscheine bekommen DONE_TAG (immer, auch wenn sie in den Papierkorb gehen),
@@ -2132,7 +2408,7 @@ def perform_merges(jobs, known_ls, delete_originals, extra):
                 pl.modify_tags([inv["id"]], add=add_now)
             if clean_title(inv["title"]) != inv["title"]:  # sonst entsteht "(merged) (merged)"
                 pl.send("PATCH", f"/api/documents/{inv['id']}/", {"title": clean_title(inv["title"])})
-            pl.merge([inv["id"]] + ls_ids, inv["id"], delete_originals)
+            pl.merge([inv["id"]] + ls_ids, inv["id"], True)  # Originale immer in den Papierkorb
             done.append({"title": clean_title(inv["title"]), "count": len(ls_ids)})
         except Exception as e:  # noqa: BLE001
             errors.append(f"{inv['title']}: {e}")
@@ -2144,13 +2420,6 @@ def perform_merges(jobs, known_ls, delete_originals, extra):
             except Exception:  # noqa: BLE001
                 pass
             continue
-        remove_again = [t for t in add_now if t != merged_tag_id]
-        if remove_again and not delete_originals:
-            try:  # Original-Rechnung bleibt erhalten -> übernommene Tags wieder entfernen, MERGED_TAG bleibt
-                pl.modify_tags([inv["id"]], remove=remove_again)
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"{inv['title']}: übernommene Tags am Original nicht entfernt: {e}")
-
     if done and AUTO_CLEAN_TITLES:
         threading.Thread(target=_auto_clean_titles, args=(len(done),), daemon=True).start()
     return done, errors
@@ -2429,6 +2698,74 @@ def audit_fix(job_id):
         except Exception as ex:  # noqa: BLE001
             errors.append(f"{e['title']}: {ex}")
     return page(AUDIT_FIXED, done=done, errors=errors, job_id=job_id)
+
+
+@app.route("/duplikate")
+@require_auth
+def dups(error=None):
+    today = dt.date.today()
+    try:
+        types = Paperless().doc_types()
+    except Exception as e:  # noqa: BLE001
+        types, error = [], error or f"Fehler bei der Abfrage von Paperless: {e}"
+    sel = {t["id"] for t in types if t["name"].lower() in (TYPE_INVOICE.lower(), TYPE_DELIVERY.lower())}
+    return page(DUPS_FORM, error=error, types=types, sel=sel,
+                start=(today - dt.timedelta(days=365)).isoformat(), end=today.isoformat())
+
+
+@app.route("/duplikate/start", methods=["POST"])
+@require_auth
+def dups_start():
+    _cleanup_audit_jobs()
+    try:
+        start = dt.date.fromisoformat(request.form["start"])
+        end = dt.date.fromisoformat(request.form["end"])
+    except (KeyError, ValueError):
+        return dups(error="Ungültige Datumsangabe.")
+    type_ids = {int(x) for x in request.form.getlist("type") if x.isdigit()}
+    if not type_ids:
+        return dups(error="Bitte mindestens einen Dokumententyp auswählen.")
+    job_id = uuid.uuid4().hex
+    AUDIT_JOBS[job_id] = {"ts": time.time(), "status": "läuft", "done": 0, "total": 0, "kind": "dups",
+                          "start": start.isoformat(), "end": end.isoformat(), "deleted": set(), "findings": [],
+                          "dir": tempfile.mkdtemp(prefix="pm-dups-")}
+    threading.Thread(target=_run_dups, args=(job_id, start, end, type_ids), daemon=True).start()
+    return redirect(url_for("dups_job", job_id=job_id))
+
+
+@app.route("/duplikate/<job_id>")
+@require_auth
+def dups_job(job_id, info=None):
+    job = AUDIT_JOBS.get(job_id)
+    if not job or job.get("kind") != "dups":
+        return dups(error="Das Ergebnis ist abgelaufen. Bitte neu suchen.")
+    job["ts"] = time.time()
+    if job["status"] == "läuft":
+        return page(AUDIT_PROGRESS, job=job, title="🧹 Duplikate werden gesucht …")
+    total_drop = sum(len(f["drop"]) for f in job["findings"])
+    return page(DOCCARD + DUPS_RESULT, job=job, job_id=job_id, total_drop=total_drop, deleted=job["deleted"],
+                info=info, link=doc_link, public=PAPERLESS_PUBLIC_URL)
+
+
+@app.route("/duplikate/<job_id>/loeschen", methods=["POST"])
+@require_auth
+def dups_delete(job_id):
+    job = AUDIT_JOBS.get(job_id)
+    if not job or job.get("kind") != "dups" or job["status"] != "fertig":
+        return dups(error="Das Ergebnis ist abgelaufen. Bitte neu suchen.")
+    allowed = {x["id"] for f in job["findings"] for x in f["drop"]}
+    keeps = {f["keep"] for f in job["findings"]}
+    ids = [i for i in dict.fromkeys(int(x) for x in request.form.getlist("del") if x.isdigit())
+           if i in allowed and i not in keeps and i not in job["deleted"]]
+    if not ids:
+        return dups_job(job_id, info="Nichts gelöscht.")
+    try:
+        Paperless().delete_docs(ids)
+        job["deleted"].update(ids)
+        info = f"✓ {len(ids)} Dokument(e) in den Paperless-Papierkorb verschoben."
+    except Exception as e:  # noqa: BLE001
+        info = f"Löschen fehlgeschlagen: {e}"
+    return dups_job(job_id, info=info)
 
 
 def doc_link(doc_id):
