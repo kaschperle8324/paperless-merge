@@ -656,6 +656,8 @@ Erste versionierte Ausgabe mit folgenden Funktionen:
 - modernes Design mit Dark Mode, volle Bildschirmbreite, Versionsanzeige
 
 ## Lizenz
+© 2026 Markus Kaspar-Otto
+
 paperless-merge steht unter der **GNU General Public License v3.0** (oder einer späteren Version) – derselben Lizenz
 wie Paperless-ngx. Den vollständigen Text enthält die Datei [LICENSE](LICENSE).
 
