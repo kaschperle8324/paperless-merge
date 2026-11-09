@@ -1,21 +1,29 @@
 # paperless-merge
 
-**Aktuelle Version: 1.1** · [Änderungen](#versionen)
+**Aktuelle Version: 1.2** · [Änderungen](#versionen)
 
-Erweiterung für **Paperless-ngx**, die Rechnungen und die dazugehörigen Lieferscheine findet und
-zu **einem PDF** zusammenführt:
+Erweiterung für **Paperless-ngx** mit zwei getrennten Bereichen:
+
+- **📎 Zusammenführen** – findet Rechnungen und die dazugehörigen Lieferscheine und führt sie zu **einem PDF** zusammen
+- **🧹 Aufräumen** – hält den Bestand sauber: doppelte/ähnliche **Korrespondenten** zusammenführen und **doppelte Dokumente** entfernen
+
+**Zusammenführen**
 
 - **Rechnung immer als erste Seite**, danach die Lieferscheine nach Datum
 - das neue Dokument läuft als Dokumententyp **Rechnung**, übernimmt Korrespondent und Speicherpfad der Rechnung
   sowie **alle Tags der Rechnung und der zugehörigen Lieferscheine**
 - **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
 - **keine Duplikate** – nach jedem Durchlauf bleibt in Paperless jede Rechnung genau einmal übrig, mit jedem zugehörigen Lieferschein genau einmal darin
-- **Duplikat-Prüfung** – vorhandene Duplikate finden, ansehen und in den Papierkorb verschieben
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
 - **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
 - **Prüfung bereits zusammengeführter Rechnungen** auf doppelt enthaltene Lieferscheine – mit Seitenvorschau und Korrektur
 - optionale **KI-Unterstützung**, in der Oberfläche einstellbar: **Texterkennung** (Mistral OCR) und **Auswertung** (OpenAI, Mistral oder andere OpenAI-kompatible API) – auch kombiniert
+
+**Aufräumen**
+- **Korrespondenten prüfen** – doppelte und ähnliche Korrespondenten (Schreibweisen, Rechtsformen, Tippfehler) finden, auf einen
+  zusammenführen (alle Dokumente werden umgehängt, die leeren gelöscht) und unbenutzte entfernen
+- **Duplikate prüfen** – doppelte Dokumente finden, nebeneinander ansehen und in den Papierkorb verschieben
 
 Die Erweiterung läuft als eigener Docker-Container neben Paperless und arbeitet ausschließlich über
 die Paperless-API. Paperless selbst wird nicht verändert.
@@ -33,7 +41,9 @@ die Paperless-API. Paperless selbst wird nicht verändert.
   - [3. Zusammenführen und Ergebnis](#3-zusammenführen-und-ergebnis)
   - [4. Rechnungen zu Lieferscheinen suchen](#4-rechnungen-zu-lieferscheinen-suchen)
   - [5. Zusammengeführte Rechnungen prüfen und korrigieren](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren)
-  - [6. Duplikate prüfen und löschen](#6-duplikate-prüfen-und-löschen)
+- [Aufräumen](#aufräumen)
+  - [Korrespondenten prüfen und zusammenführen](#korrespondenten-prüfen-und-zusammenführen)
+  - [Duplikate prüfen und löschen](#duplikate-prüfen-und-löschen)
 - [KI-Unterstützung](#ki-unterstützung)
 - [Was mit den Originalen passiert](#was-mit-den-originalen-passiert)
 - [Wie die Zuordnung funktioniert](#wie-die-zuordnung-funktioniert)
@@ -124,11 +134,12 @@ Die Oberfläche ist durch eine Anmeldung geschützt.
 Die Oberfläche nutzt die volle Bildschirmbreite, passt sich an Handy und Tablet an und schaltet
 automatisch in den **Dark Mode**, wenn das Gerät dunkel eingestellt ist.
 
-**Kopfzeile** (auf jeder Seite)
-- **⌂ Start** – zurück zur Startseite; ein Klick auf das Logo bzw. den Titel geht ebenfalls dorthin.
-- **🔎 Prüfen** – [zusammengeführte Rechnungen prüfen](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren).
-- **🧹 Duplikate** – [Duplikate prüfen und löschen](#6-duplikate-prüfen-und-löschen).
-- **⚙ Einstellungen** – [KI-Zugänge einrichten](#ki-unterstützung).
+**Kopfzeile** (auf jeder Seite) – die beiden Hauptbereiche sind getrennt; der aktive ist hervorgehoben:
+- **📎 Zusammenführen** – Bereich mit den Reitern *Rechnung + Lieferschein* (Startseite) und
+  [*Zusammengeführte prüfen*](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren). Ein Klick auf das Logo führt ebenfalls hierher.
+- **🧹 Aufräumen** – Bereich mit den Reitern *Übersicht*, [*Korrespondenten*](#korrespondenten-prüfen-und-zusammenführen)
+  und [*Duplikate*](#duplikate-prüfen-und-löschen).
+- **⚙ Einstellungen** – [KI-Zugänge einrichten](#ki-unterstützung) und Zugang ändern.
 - **Paperless öffnen ↗** – öffnet die Paperless-Instanz in einem neuen Tab. Verwendet wird `PAPERLESS_PUBLIC_URL`,
   wenn gesetzt, sonst `PAPERLESS_URL`. Steht in `PAPERLESS_URL` ein Containername (z. B. `http://paperless:8000`),
   den der Browser nicht kennt, `PAPERLESS_PUBLIC_URL` mit der Adresse setzen, unter der Paperless im Browser aufgerufen wird.
@@ -170,7 +181,7 @@ kommt eine Sicherheitsabfrage.
 Oben steht eine Übersicht: Zeitraum, Anzahl der Rechnungen **mit Vorschlag**, Rechnungen **ohne**
 gefundenen Lieferschein, **freie** Lieferscheine, ggf. **bereits ergänzte (ausgeblendete)** Rechnungen und
 **schon enthaltene** Lieferscheine, gewählte Korrespondenten und zusätzliche Tags. Liegen in Paperless noch Originale, die schon
-in einer zusammengeführten Rechnung stecken, weist ein Hinweis darauf hin (Aufräumen über *🧹 Duplikate*).
+in einer zusammengeführten Rechnung stecken, weist ein Hinweis darauf hin (Aufräumen über *🧹 Aufräumen → Duplikate*).
 
 Darunter steht jede Rechnung als eigene Karte (auf breiten Bildschirmen mehrere nebeneinander):
 - **Vorschaubild** und Link **PDF ansehen** (bzw. *in Paperless öffnen*, wenn `PAPERLESS_PUBLIC_URL` gesetzt ist)
@@ -261,7 +272,7 @@ die schon einmal zusammengeführt wurden.
   Wurde eine Rechnung verwendet, die auch auf der Prüfseite steht, muss die Prüfseite neu erstellt werden.
 
 ### 5. Zusammengeführte Rechnungen prüfen und korrigieren
-Über **🔎 Prüfen** in der Kopfzeile lassen sich alle Rechnungen kontrollieren, die schon mit Lieferscheinen
+Im Bereich **📎 Zusammenführen** über den Reiter **🔎 Zusammengeführte prüfen** lassen sich alle Rechnungen kontrollieren, die schon mit Lieferscheinen
 zusammengeführt wurden (Tag `LS-ergänzt` oder Paperless-Datei `…_merged.pdf` – auch direkt in Paperless
 zusammengeführte Dokumente).
 
@@ -291,8 +302,46 @@ korrigiert und danach mit *korrigiert* gekennzeichnet – für eine Kontrolle di
 
 ---
 
-### 6. Duplikate prüfen und löschen
-Über **🧹 Duplikate** in der Kopfzeile lässt sich der Bestand in Paperless auf Duplikate prüfen – z. B. Reste aus
+## Aufräumen
+Der Bereich **🧹 Aufräumen** ist vom Zusammenführen getrennt und kann jederzeit unabhängig davon genutzt werden.
+Vor jeder Änderung wird alles zur Kontrolle angezeigt.
+
+### Korrespondenten prüfen und zusammenführen
+Unter **🧹 Aufräumen → 👥 Korrespondenten** werden alle Korrespondenten aus Paperless verglichen.
+
+**Was erkannt wird**
+| Kennzeichen | Beispiel | Vorauswahl |
+|---|---|---|
+| 🟥 **gleich** – gleicher Name, nur andere Schreibweise oder Rechtsform | „Schäfer GmbH“ / „Schaefer GmbH“ / „SCHÄFER gmbh“, „Elektro Müller e.K.“ / „Elektro-Müller“ | angehakt |
+| 🟧 **ähnlich** – Tippfehler | „Schäfer GmbH“ / „Schäffer GmbH“ | nicht angehakt |
+| 🟧 **ähnlich** – Name im anderen enthalten | „Telekom“ / „Deutsche Telekom AG“ | nicht angehakt |
+
+Beim Vergleich zählen Umlaute (ä = ae), Groß-/Kleinschreibung, Satzzeichen, Bindestriche und Rechtsformen (GmbH, KG,
+& Co., AG, e.K., UG …) nicht. Allgemeine Wörter wie *Elektro*, *Bau*, *Stadtwerke* oder *Sparkasse* allein führen
+nicht zu einem Treffer – „Stadtwerke Sontra“ und „Stadtwerke Eschwege“ bleiben getrennt.
+
+**Ablauf**
+1. Je Gruppe den **Ziel-Korrespondenten** wählen (◉, vorgewählt: der mit den meisten Dokumenten) und die Korrespondenten
+   anhaken, die darin aufgehen sollen. Bei Bedarf den **Namen des Ziels** anpassen.
+2. Optional unter **✋ Manuell zusammenführen** weitere Korrespondenten auswählen, die nicht automatisch erkannt wurden.
+3. Optional unter **Korrespondenten ohne Dokumente** unbenutzte zum Löschen anhaken (nicht vorausgewählt – sie könnten in
+   Mail-Regeln oder Workflows verwendet werden).
+4. **Ausgewählte zusammenführen & leere löschen** – eine Zusammenfassung zeigt vorher genau, was passiert.
+
+**Was passiert**
+- Alle Dokumente der ausgewählten Korrespondenten werden dem Ziel zugewiesen.
+- Danach wird geprüft, dass keiner mehr Dokumente hat – erst dann wird er gelöscht. Bleiben Dokumente übrig
+  (z. B. fehlende Berechtigung), wird er nicht gelöscht und ein Hinweis angezeigt.
+- Mit *Suchbegriffe … übernehmen* (Standard: an) werden die Suchbegriffe der gelöschten Korrespondenten in das Ziel übernommen,
+  sofern beide die Zuordnung „irgendein Wort“ oder „alle Wörter“ verwenden.
+- Der Name des Ziels wird zuletzt geändert – so kann es auch den Namen eines gelöschten Korrespondenten übernehmen.
+- Ein Korrespondent kann nicht gleichzeitig Ziel und Quelle sein; widersprüchliche Auswahlen werden abgelehnt, ohne etwas zu ändern.
+
+Hinweis: Gespeicherte Ansichten, Mail-Regeln oder Workflows in Paperless, die einen gelöschten Korrespondenten verwenden,
+müssen danach ggf. auf das Ziel umgestellt werden.
+
+### Duplikate prüfen und löschen
+Unter **🧹 Aufräumen → 📄 Duplikate** lässt sich der Bestand in Paperless auf Duplikate prüfen – z. B. Reste aus
 früheren Läufen oder doppelt eingescannte Belege.
 
 1. Zeitraum (Dokumentdatum) und Dokumententypen wählen (vorausgewählt: *Rechnung* und *Lieferschein*) und
@@ -395,7 +444,7 @@ Paperless zusammengeführt wurden.
 
 Außerdem wird der **Inhalt** verglichen: Eine Rechnung oder ein Lieferschein, dessen Text schon in einer
 zusammengeführten Rechnung steckt (z. B. ein übrig gebliebenes Original), wird nicht erneut angeboten – auch ohne
-Tag und ohne erkannte Nummer. Die Prüfseite weist dann auf *🧹 Duplikate* zum Aufräumen hin.
+Tag und ohne erkannte Nummer. Die Prüfseite weist dann auf *🧹 Aufräumen → Duplikate* hin.
 
 Ausgeblendete Rechnungen werden trotzdem für die Zuordnung verwendet: Steht die Nummer eines Lieferscheins in
 einer schon ergänzten Rechnung, wird dieser Lieferschein keiner anderen Rechnung zugeschlagen, sondern als
@@ -501,12 +550,19 @@ Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorra
 | Passwort vergessen | `benutzer.json` im Datenverzeichnis löschen und die Seite neu aufrufen – dann einen neuen Zugang anlegen. |
 | *Zu viele Fehlversuche* | 10 Minuten warten. |
 | Nach jedem Neustart abgemeldet | Das Volume `./data:/data` fehlt – dann wird der Sitzungsschlüssel nicht gespeichert. |
-| Duplikate aus früheren Versionen (Original und zusammengeführte Fassung) | Mit **🧹 Duplikate** suchen und löschen. Seit Version 1.1 entstehen keine neuen mehr. |
+| Duplikate aus früheren Versionen (Original und zusammengeführte Fassung) | Mit **🧹 Aufräumen → Duplikate** suchen und löschen. Seit Version 1.1 entstehen keine neuen mehr. |
 | Alte Oberfläche nach Update | Browser-Cache: Seite mit **Strg + F5** neu laden. |
 
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 1.2 (09.11.2026)
+- Oberfläche in zwei getrennte Bereiche aufgeteilt: **📎 Zusammenführen** (Rechnung + Lieferschein, Zusammengeführte prüfen) und **🧹 Aufräumen** (Übersicht, Korrespondenten, Duplikate) – jeweils mit Reitern
+- neue Funktion **Korrespondenten prüfen**: doppelte und ähnliche Korrespondenten finden (Schreibweise, Rechtsform, Tippfehler, enthaltener Name), Ziel wählen, Dokumente umhängen, leere Korrespondenten löschen, Ziel umbenennen
+- manuelles Zusammenführen beliebiger Korrespondenten und Löschen unbenutzter Korrespondenten
+- Suchbegriffe gelöschter Korrespondenten werden ins Ziel übernommen
+- Kopfzeile neu: *Paperless Merge – Zusammenführen & Aufräumen*
 
 ### Version 1.1 (05.11.2026)
 - **keine Duplikate mehr:** nach jedem Zusammenführen bleibt in Paperless je Rechnung genau ein Dokument übrig – die Originale gehen immer in den Papierkorb; die Option *Originale behalten* (Ursache der bisherigen Duplikate) entfällt

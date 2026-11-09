@@ -209,6 +209,28 @@ class Paperless:
             docs = [d for d in docs if d.get("correspondent") == corr_id]
         return docs
 
+    def correspondents_full(self):
+        return sorted(self.all("/api/correspondents/"), key=lambda c: c["name"].lower())
+
+    def doc_ids_of_correspondent(self, corr_id):
+        docs = self.all("/api/documents/", correspondent__id=corr_id, fields="id,correspondent")
+        return [d["id"] for d in docs if d.get("correspondent") == corr_id]  # nur echte Treffer anfassen
+
+    def set_correspondent(self, doc_ids, corr_id):
+        for i in range(0, len(doc_ids), 500):
+            self.send("POST", "/api/documents/bulk_edit/", {"documents": doc_ids[i:i + 500],
+                                                            "method": "set_correspondent",
+                                                            "parameters": {"correspondent": corr_id}})
+
+    def delete_correspondent(self, corr_id):
+        return self.send("DELETE", f"/api/correspondents/{corr_id}/", None)
+
+    def rename_correspondent(self, corr_id, name):
+        return self.send("PATCH", f"/api/correspondents/{corr_id}/", {"name": name})
+
+    def set_correspondent_match(self, corr_id, match):
+        return self.send("PATCH", f"/api/correspondents/{corr_id}/", {"match": match})
+
     def correspondent_list(self):
         return sorted(self.all("/api/correspondents/"), key=lambda c: c["name"].lower())
 
@@ -1193,6 +1215,80 @@ def _run_dups(job_id, start, end, type_ids):
         job["error"] = str(e)[:300]
 
 
+# --------------------------------------------------------------------------- Aufräumen: Korrespondenten
+_LEGAL_FORMS = {"gmbh", "mbh", "co", "kg", "ag", "ug", "haftungsbeschraenkt", "ek", "ohg", "gbr", "se", "kgaa", "eg",
+                "ev", "inc", "ltd", "llc", "limited", "corp", "sarl", "bv", "nv", "spa", "srl", "und", "the", "fa",
+                "firma", "gesellschaft", "mit", "beschraenkter", "haftung", "kommanditgesellschaft"}
+_GENERIC = {"elektro", "bau", "service", "services", "handel", "technik", "gruppe", "group", "holding", "deutschland",
+            "germany", "online", "shop", "versand", "partner", "solutions", "systeme", "systems", "international",
+            "stadt", "gemeinde", "verwaltung", "bank", "sparkasse", "versicherung", "autohaus", "apotheke", "praxis"}
+_TRANSLIT = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "é": "e", "è": "e", "á": "a", "à": "a"})
+
+
+def corr_tokens(name):
+    """Name vereinheitlichen: klein, Umlaute umschreiben, Satzzeichen und Rechtsformen entfernen."""
+    s = (name or "").lower().translate(_TRANSLIT)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return [t for t in s.split() if t not in _LEGAL_FORMS and len(t) > 1]
+
+
+def corr_similarity(a, b):
+    """Rückgabe (score, grund) für zwei Korrespondenten-Namen oder (0, '')."""
+    ta, tb = corr_tokens(a), corr_tokens(b)
+    ka, kb = " ".join(ta), " ".join(tb)
+    if not ka or not kb:
+        return 0, ""
+    if ka == kb:
+        return 1.0, "gleicher Name (Schreibweise/Rechtsform)"
+    if "".join(ta) == "".join(tb):
+        return 0.97, "gleicher Name (Leerzeichen/Bindestriche)"
+    ratio = difflib.SequenceMatcher(None, ka, kb).ratio()
+    if ratio >= 0.88 and min(len(ka), len(kb)) >= 5:
+        return ratio, f"sehr ähnlich geschrieben ({round(ratio * 100)} %)"
+    small, big = (set(ta), set(tb)) if len(ta) <= len(tb) else (set(tb), set(ta))
+    if small < big and any(len(t) >= 4 and t not in _GENERIC for t in small):
+        return 0.8, "Name in anderem enthalten"
+    return 0, ""
+
+
+def find_corr_groups(corrs):
+    """Gruppiert doppelte/ähnliche Korrespondenten. corrs: Liste aus der Paperless-API."""
+    ids = [c["id"] for c in corrs]
+    by_id = {c["id"]: c for c in corrs}
+    parent = {i: i for i in ids}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    edges = {}
+    for i in range(len(corrs)):
+        for j in range(i + 1, len(corrs)):
+            a, b = corrs[i], corrs[j]
+            score, why = corr_similarity(a["name"], b["name"])
+            if score >= 0.8:
+                edges[(a["id"], b["id"])] = (score, why)
+                parent[find(a["id"])] = find(b["id"])
+    groups = {}
+    for i in ids:
+        groups.setdefault(find(i), []).append(i)
+    out = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        sure = all(edges.get((x, y), edges.get((y, x), (1, "")))[0] >= 0.97
+                   for k, x in enumerate(members) for y in members[k + 1:]
+                   if (x, y) in edges or (y, x) in edges)
+        reasons = sorted({w for (x, y), (sc, w) in edges.items() if x in members and y in members})
+        # Ziel: meiste Dokumente, sonst kürzester Name, sonst kleinste ID
+        target = max(members, key=lambda m: (by_id[m].get("document_count") or 0, -len(by_id[m]["name"]), -m))
+        out.append({"members": sorted(members, key=lambda m: (-(by_id[m].get("document_count") or 0), by_id[m]["name"])),
+                    "target": target, "sure": sure, "reasons": reasons})
+    out.sort(key=lambda g: (not g["sure"], by_id[g["target"]]["name"].lower()))
+    return out
+
+
 # --------------------------------------------------------------------------- Suche nach Rechnungen zu Lieferscheinen
 def search_variants(num):
     """Suchbegriffe für die Textsuche in Paperless: Nummer, OCR-Form und die letzten 5 Ziffern."""
@@ -1369,7 +1465,7 @@ def require_auth(f):
 BASE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Rechnung + Lieferschein</title><style>
+<title>Paperless Merge</title><style>
 :root{
   --bg:#f5f6fa;--surface:#fff;--surface2:#f0f2f8;--text:#111827;--muted:#6b7280;--line:#e5e7eb;
   --accent:#6366f1;--accent2:#8b5cf6;--accent-soft:#eef2ff;--ring:#6366f155;
@@ -1441,6 +1537,11 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.ctab{width:100%;border-collapse:collapse;margin-top:10px;font-size:.9rem}
+.ctab th{text-align:left;font-size:.75rem;color:var(--muted);font-weight:600;padding:4px 6px;border-bottom:1px solid var(--line)}
+.ctab td{padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+.ctab input{width:18px;height:18px;accent-color:var(--accent)}
+select[multiple]{min-height:180px}
 .dupcase{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:18px}
 @media (max-width:800px){.dupcase{grid-template-columns:1fr}}
 .dupcol.keep{border-right:1px solid var(--line);padding-right:14px}
@@ -1480,19 +1581,44 @@ header{flex-wrap:wrap}
 .hbtn{padding:7px 14px;border-radius:10px;border:1px solid var(--line);background:var(--surface2);color:var(--text);
   text-decoration:none;font-size:.88rem;font-weight:600}
 .hbtn:hover{border-color:var(--accent);color:var(--accent)}
+.hbtn.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.subnav{display:flex;gap:4px;flex-wrap:wrap;padding:0 clamp(12px,2vw,32px);border-bottom:1px solid var(--line);background:var(--surface)}
+.subnav a{padding:10px 14px;text-decoration:none;color:var(--muted);font-weight:600;font-size:.9rem;border-bottom:2px solid transparent}
+.subnav a.on{color:var(--accent);border-bottom-color:var(--accent)}
+.subnav a:hover{color:var(--text)}
 .ver{padding:4px 12px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:.8rem;font-weight:600}
 ul{padding-left:18px}
 </style></head><body>
-<header><a href="{{ url_for('index') }}" class="home"><div class="logo">R+L</div><div><h1>Rechnung + Lieferschein</h1><small>Paperless-ngx Zusammenführung</small></div></a>
-<nav class="hnav">{% if show_nav %}<a class="hbtn" href="{{ url_for('index') }}">⌂ Start</a>
-<a class="hbtn" href="{{ url_for('audit') }}">🔎 Prüfen</a>
-<a class="hbtn" href="{{ url_for('dups') }}">🧹 Duplikate</a>
-<a class="hbtn" href="{{ url_for('settings') }}">⚙ Einstellungen</a>
+<header><a href="{{ url_for('index') }}" class="home"><div class="logo">PM</div><div><h1>Paperless Merge</h1><small>Zusammenführen &amp; Aufräumen</small></div></a>
+<nav class="hnav">{% if show_nav %}<a class="hbtn {{ 'on' if area == 'merge' }}" href="{{ url_for('index') }}">📎 Zusammenführen</a>
+<a class="hbtn {{ 'on' if area == 'clean' }}" href="{{ url_for('cleanup_home') }}">🧹 Aufräumen</a>
+<a class="hbtn {{ 'on' if area == 'settings' }}" href="{{ url_for('settings') }}">⚙ Einstellungen</a>
 {% if paperless_link %}<a class="hbtn" href="{{ paperless_link }}" target="_blank" rel="noopener">Paperless öffnen ↗</a>{% endif %}
 {% if current_user %}<a class="hbtn" href="{{ url_for('logout') }}" title="Abmelden">👤 {{ current_user }} · Abmelden</a>{% endif %}{% endif %}
 <span class="ver">v{{ version }}</span></nav></header>
+{% if show_nav and tabs %}<div class="subnav">{% for ep, label in tabs %}<a class="{{ 'on' if ep == active_tab }}" href="{{ url_for(ep) }}">{{ label }}</a>{% endfor %}</div>{% endif %}
 <main>
 {% block body %}{% endblock %}</main></body></html>"""
+
+
+# Bereiche der Oberfläche: Zusammenführen und Aufräumen sind getrennt, jeweils mit eigenen Unterseiten
+AREAS = {
+    "merge": {"index", "preview", "review", "execute", "search_ls", "search_merge", "mark_done", "audit", "audit_start",
+              "audit_job", "audit_fix", "cleanup_titles"},
+    "clean": {"cleanup_home", "corr_check", "corr_apply", "dups", "dups_start", "dups_job", "dups_delete"},
+    "settings": {"settings", "change_password"},
+}
+AREA_TABS = {
+    "merge": [("index", "📎 Rechnung + Lieferschein"), ("audit", "🔎 Zusammengeführte prüfen")],
+    "clean": [("cleanup_home", "Übersicht"), ("corr_check", "👥 Korrespondenten"), ("dups", "📄 Duplikate")],
+}
+TAB_EPS = {  # welche Seiten zu welchem Reiter gehören
+    "index": {"index", "preview", "review", "execute", "search_ls", "search_merge", "mark_done", "cleanup_titles"},
+    "audit": {"audit", "audit_start", "audit_job", "audit_fix"},
+    "cleanup_home": {"cleanup_home"},
+    "corr_check": {"corr_check", "corr_apply"},
+    "dups": {"dups", "dups_start", "dups_job", "dups_delete"},
+}
 
 
 def page(body, **ctx):
@@ -1500,6 +1626,11 @@ def page(body, **ctx):
     ctx.setdefault("paperless_link", PAPERLESS_BROWSER_URL)
     ctx.setdefault("current_user", logged_in_user())
     ctx.setdefault("show_nav", True)
+    ep = request.endpoint or ""
+    area = next((a for a, eps in AREAS.items() if ep in eps), "")
+    ctx.setdefault("area", area)
+    ctx.setdefault("tabs", AREA_TABS.get(area, []))
+    ctx.setdefault("active_tab", next((t for t, eps in TAB_EPS.items() if ep in eps), ep))
     return render_template_string(BASE.replace("{% block body %}{% endblock %}", body), **ctx)
 
 
@@ -2081,6 +2212,134 @@ DOCCARD = """{% macro doccard(d) %}<div class="dc">
     <span class="meta">{{ d.date|de }} · {{ d.correspondent }}{% if d.pages %} · {{ d.pages }} S.{% endif %}{% if d.asn %} · ASN {{ d.asn }}{% endif %}
       · ID {{ d.id }} · <a href="{{ link(d.id) }}" target="_blank">{{ "in Paperless öffnen" if public else "PDF ansehen" }}</a></span></div>
 </div>{% endmacro %}"""
+
+CLEAN_HOME = """
+<div class="card"><h3>🧹 Aufräumen</h3>
+  <p class="meta" style="margin-top:0">Werkzeuge, um den Bestand in Paperless sauber zu halten – unabhängig vom Zusammenführen.
+    Vor jeder Änderung wird alles zur Kontrolle angezeigt.</p></div>
+<div class="groups">
+  <div class="card"><h3>👥 Korrespondenten</h3>
+    <p class="meta">Findet doppelte und ähnliche Korrespondenten (Schreibweisen, Rechtsformen, Tippfehler), führt ausgewählte
+      zusammen – alle Dokumente gehen an einen Korrespondenten, die leeren werden gelöscht – und entfernt unbenutzte.</p>
+    <a class="btn" href="{{ url_for('corr_check') }}">Korrespondenten prüfen →</a></div>
+  <div class="card"><h3>📄 Duplikate</h3>
+    <p class="meta">Findet doppelte Dokumente – z. B. Originale neben zusammengeführten Rechnungen oder doppelte Scans –
+      zeigt sie nebeneinander an und verschiebt sie auf Wunsch in den Papierkorb.</p>
+    <a class="btn" href="{{ url_for('dups') }}">Duplikate prüfen →</a></div>
+</div>
+"""
+
+CORR_CHECK = """
+{% if error %}<div class="card err">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url_for('corr_apply') }}" id="cf">
+<input type="hidden" name="plan" value="{{ plan_id }}">
+<div class="card"><h3>👥 Korrespondenten prüfen</h3>
+  <div class="stats">
+    <div class="stat"><b>{{ total }}</b><span class="meta">Korrespondenten</span></div>
+    <div class="stat"><b>{{ groups|length }}</b><span class="meta">Gruppen doppelt/ähnlich</span></div>
+    <div class="stat"><b>{{ unused|length }}</b><span class="meta">ohne Dokumente</span></div>
+  </div>
+  <p class="meta">Je Gruppe den <b>Ziel-Korrespondenten</b> wählen (◉) und die Korrespondenten anhaken, die darin aufgehen sollen.
+    Deren Dokumente werden dem Ziel zugewiesen, danach werden sie gelöscht. Der Name des Ziels lässt sich dabei anpassen.
+    <span class="badge unsicher">gleich</span> = vorausgewählt, <span class="badge mittel">ähnlich</span> = bitte selbst entscheiden.</p>
+</div>
+{% if not groups %}<div class="card ok">Keine doppelten oder ähnlichen Korrespondenten gefunden.</div>{% endif %}
+<div class="groups">
+{% for g in groups %}{% set gi = loop.index0 %}
+<div class="card">
+  <input type="hidden" name="groups" value="{{ gi }}">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <span class="badge {{ 'unsicher' if g.sure else 'mittel' }}">{{ 'gleich' if g.sure else 'ähnlich' }}</span>
+    <span class="meta">{{ g.reasons|join(' · ') }}</span></div>
+  <table class="ctab">
+    <tr><th>Ziel</th><th>zusammen&shy;führen</th><th>Korrespondent</th><th>Dok.</th><th></th></tr>
+    {% for m in g.rows %}
+    <tr>
+      <td><input type="radio" name="t_{{ gi }}" value="{{ m.id }}" {{ 'checked' if m.id == g.target }} class="tsel" data-g="{{ gi }}"></td>
+      <td><input type="checkbox" name="m_{{ gi }}" value="{{ m.id }}" class="msel" data-g="{{ gi }}" {{ 'checked' if m.pre }}></td>
+      <td><b>{{ m.name }}</b>{% if m.match %}<br><span class="meta">Zuordnung: {{ m.match }}</span>{% endif %}</td>
+      <td>{{ m.document_count }}</td>
+      <td class="meta">{{ m.why }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <label class="f" style="margin-top:10px">Name des Ziel-Korrespondenten</label>
+  <input type="text" name="n_{{ gi }}" value="{{ g.target_name }}" maxlength="128">
+</div>
+{% endfor %}
+</div>
+
+<div class="card"><h3>✋ Manuell zusammenführen</h3>
+  <p class="meta" style="margin-top:0">Für Fälle, die nicht automatisch erkannt wurden: Korrespondenten auswählen (Strg/Cmd für Mehrfachauswahl)
+    und ein Ziel festlegen.</p>
+  <div class="grid2">
+    <div><label class="f">Diese Korrespondenten …</label>
+      <select name="manual_src" multiple size="8">{% for c in all %}<option value="{{ c.id }}">{{ c.name }} ({{ c.document_count }})</option>{% endfor %}</select></div>
+    <div><label class="f">… zusammenführen in</label>
+      <select name="manual_target"><option value="">– Ziel wählen –</option>{% for c in all %}<option value="{{ c.id }}">{{ c.name }} ({{ c.document_count }})</option>{% endfor %}</select></div>
+  </div>
+</div>
+
+{% if unused %}
+<details class="card"><summary><b>{{ unused|length }} Korrespondenten ohne Dokumente</b> – löschen?</summary>
+  <p class="meta">Achtung: Werden sie in Mail-Regeln oder Workflows von Paperless verwendet, gehen diese Einstellungen verloren.
+    Deshalb nicht vorausgewählt.</p>
+  <button type="button" class="linkbtn" id="allunused">alle auswählen</button>
+  <div class="ulist">{% for c in unused %}<label class="urow"><input type="checkbox" name="unused" value="{{ c.id }}" class="usel">
+    <span><b>{{ c.name }}</b>{% if c.match %} <span class="meta">· Zuordnung: {{ c.match }}</span>{% endif %}</span></label>{% endfor %}</div>
+</details>
+{% endif %}
+
+<div class="card"><label class="switch" style="margin:0"><input type="checkbox" name="keep_match" value="1" checked>
+  Suchbegriffe der gelöschten Korrespondenten in das Ziel übernehmen</label>
+  <p class="meta">Gilt, wenn Ziel und Quelle die Zuordnung „irgendein Wort“ oder „alle Wörter“ verwenden – sonst gehen die
+    Zuordnungsregeln der gelöschten Korrespondenten verloren.</p></div>
+<div class="card bar"><span class="meta" id="csum">Nichts ausgewählt.</span>
+  <button type="submit">Ausgewählte zusammenführen &amp; leere löschen</button></div>
+</form>
+<script>
+const NAMES = {{ names|tojson }};
+function summary() {
+  let moves = 0, dels = 0, parts = [];
+  document.querySelectorAll('input[name=groups]').forEach(h => {
+    const g = h.value, t = document.querySelector('.tsel[data-g="' + g + '"]:checked');
+    const src = [...document.querySelectorAll('.msel[data-g="' + g + '"]:checked')].filter(c => !t || c.value !== t.value);
+    if (t && src.length) { dels += src.length; parts.push(src.map(c => NAMES[c.value]).join(', ') + ' → ' + NAMES[t.value]); }
+  });
+  const ms = [...document.querySelector('select[name=manual_src]').selectedOptions].map(o => o.value);
+  const mt = document.querySelector('select[name=manual_target]').value;
+  const msrc = ms.filter(v => v !== mt);
+  if (mt && msrc.length) { dels += msrc.length; parts.push(msrc.map(v => NAMES[v]).join(', ') + ' → ' + NAMES[mt]); }
+  const un = document.querySelectorAll('.usel:checked').length;
+  document.getElementById('csum').textContent = (parts.length || un) ?
+    (dels + ' Korrespondent(en) zusammenführen' + (un ? ', ' + un + ' unbenutzte löschen' : '')) : 'Nichts ausgewählt.';
+  return {parts, dels, un};
+}
+document.getElementById('cf').addEventListener('change', summary);
+const au = document.getElementById('allunused');
+if (au) au.addEventListener('click', () => { document.querySelectorAll('.usel').forEach(c => c.checked = true); summary(); });
+document.querySelectorAll('.tsel').forEach(r => r.addEventListener('change', () => {
+  const m = document.querySelector('.msel[data-g="' + r.dataset.g + '"][value="' + r.value + '"]'); if (m) m.checked = true;
+  const n = document.querySelector('input[name="n_' + r.dataset.g + '"]'); if (n) n.value = NAMES[r.value];
+}));
+summary();
+document.getElementById('cf').addEventListener('submit', e => {
+  const s = summary();
+  if (!s.parts.length && !s.un) { alert('Nichts ausgewählt.'); e.preventDefault(); return; }
+  if (!confirm('Folgendes ausführen?\\n\\n' + s.parts.join('\\n') + (s.un ? '\\n\\n' + s.un + ' unbenutzte Korrespondenten löschen' : '')
+      + '\\n\\nDokumente werden umgehängt, die zusammengeführten Korrespondenten danach gelöscht.')) e.preventDefault();
+});
+</script>
+"""
+
+CORR_RESULT = """
+<div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Korrespondenten aufgeräumt</h3>
+  {{ moved }} Dokument(e) umgehängt · {{ deleted }} Korrespondent(en) gelöscht{% if renamed %} · {{ renamed }} umbenannt{% endif %}
+  {% if errors %} · {{ errors|length }} Fehler{% endif %}</div>
+{% for l in lines %}<div class="card">✔ {{ l }}</div>{% endfor %}
+{% for e in errors %}<div class="card err">✘ {{ e }}</div>{% endfor %}
+<div class="card"><a class="btn" href="{{ url_for('corr_check') }}">Erneut prüfen</a></div>
+"""
 
 RESULT = """
 <div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Ergebnis</h3>
@@ -2698,6 +2957,158 @@ def audit_fix(job_id):
         except Exception as ex:  # noqa: BLE001
             errors.append(f"{e['title']}: {ex}")
     return page(AUDIT_FIXED, done=done, errors=errors, job_id=job_id)
+
+
+MATCH_NAMES = {0: "keine", 1: "irgendein Wort", 2: "alle Wörter", 3: "exakt", 4: "regulärer Ausdruck",
+               5: "ungenaues Wort", 6: "automatisch"}
+
+
+def _match_info(c):
+    algo = c.get("matching_algorithm")
+    name = MATCH_NAMES.get(algo, "")
+    if algo in (None, 0) or not name:
+        return ""
+    return f"{name}{(': ' + c['match']) if c.get('match') and algo not in (6,) else ''}"
+
+
+@app.route("/aufraeumen")
+@require_auth
+def cleanup_home():
+    return page(CLEAN_HOME)
+
+
+@app.route("/aufraeumen/korrespondenten")
+@require_auth
+def corr_check(error=None):
+    _cleanup_plans()
+    try:
+        corrs = Paperless().correspondents_full()
+    except Exception as e:  # noqa: BLE001
+        return page(CLEAN_HOME + '<div class="card err">Fehler bei der Abfrage von Paperless: {{ e }}</div>', e=str(e))
+    by_id = {c["id"]: c for c in corrs}
+    groups = find_corr_groups(corrs)
+    for g in groups:
+        tname = by_id[g["target"]]["name"]
+        g["target_name"] = tname
+        g["rows"] = []
+        for m in g["members"]:
+            c = by_id[m]
+            sc, why = (1.0, "Ziel") if m == g["target"] else corr_similarity(c["name"], tname)
+            if m != g["target"] and not why:
+                why = "ähnlich über andere Gruppenmitglieder"
+            g["rows"].append({"id": m, "name": c["name"], "document_count": c.get("document_count") or 0,
+                              "match": _match_info(c), "why": why if m != g["target"] else "",
+                              "pre": m == g["target"] or sc >= 0.97})
+    grouped = {m for g in groups for m in g["members"]}
+    unused = [{**c, "match": _match_info(c)} for c in corrs if not c.get("document_count") and c["id"] not in grouped]
+    plan_id = uuid.uuid4().hex
+    with PLANS_LOCK:
+        PLANS[plan_id] = {"ts": time.time(), "corr": True, "groups": groups, "ids": set(by_id),
+                          "unused": {c["id"] for c in unused}, "names": {c["id"]: c["name"] for c in corrs},
+                          "match": {c["id"]: (c.get("matching_algorithm"), c.get("match") or "") for c in corrs}}
+    return page(CORR_CHECK, error=error, plan_id=plan_id, groups=groups, unused=unused, total=len(corrs),
+                all=corrs, names={str(k): v["name"] for k, v in by_id.items()})
+
+
+@app.route("/aufraeumen/korrespondenten/ausfuehren", methods=["POST"])
+@require_auth
+def corr_apply():
+    with PLANS_LOCK:
+        st = PLANS.pop(request.form.get("plan", ""), None)
+    if not st or not st.get("corr"):
+        return corr_check(error="Die Prüfung ist abgelaufen oder wurde schon ausgeführt. Bitte erneut prüfen.")
+    f, names = request.form, st["names"]
+    jobs = []  # (ziel, [quellen], neuer_name)
+    for gi in f.getlist("groups"):
+        if not gi.isdigit() or int(gi) >= len(st["groups"]):
+            continue
+        g = st["groups"][int(gi)]
+        t = f.get(f"t_{gi}", "")
+        if not t.isdigit() or int(t) not in g["members"]:
+            continue
+        target = int(t)
+        srcs = [int(x) for x in f.getlist(f"m_{gi}") if x.isdigit() and int(x) in g["members"] and int(x) != target]
+        new_name = (f.get(f"n_{gi}") or "").strip()[:128]
+        if srcs or (new_name and new_name != names[target]):
+            jobs.append((target, srcs, new_name))
+    mt = f.get("manual_target", "")
+    msrc = [int(x) for x in f.getlist("manual_src") if x.isdigit() and int(x) in st["ids"]]
+    if mt.isdigit() and int(mt) in st["ids"]:
+        msrc = [x for x in msrc if x != int(mt)]
+        if msrc:
+            jobs.append((int(mt), msrc, ""))
+    # Plausibilität: kein Korrespondent darf gleichzeitig Ziel und zu löschende Quelle sein
+    targets = {t for t, _, _ in jobs}
+    seen = set()
+    for t, srcs, _ in jobs:
+        for s_ in srcs:
+            if s_ in targets or s_ in seen:
+                return corr_check(error=f"„{names[s_]}“ ist mehrfach bzw. gleichzeitig als Ziel ausgewählt. "
+                                        "Es wurde nichts geändert.")
+            seen.add(s_)
+    unused = [int(x) for x in f.getlist("unused") if x.isdigit() and int(x) in st["unused"] and int(x) not in targets]
+
+    pl = Paperless()
+    moved = deleted = renamed = 0
+    lines, errors = [], []
+    for target, srcs, new_name in jobs:
+        n_moved, gone = 0, []
+        for s_ in srcs:
+            try:
+                ids = pl.doc_ids_of_correspondent(s_)
+                if ids:
+                    pl.set_correspondent(ids, target)
+                    n_moved += len(ids)
+                if pl.doc_ids_of_correspondent(s_):
+                    errors.append(f"„{names[s_]}“ hat noch Dokumente (fehlende Berechtigung?) – nicht gelöscht.")
+                    continue
+                pl.delete_correspondent(s_)
+                gone.append(names[s_])
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"„{names[s_]}“: {e}")
+        moved += n_moved
+        deleted += len(gone)
+        tname = names[target]
+        # Suchbegriffe der gelöschten Korrespondenten übernehmen (nur bei "irgendein Wort"/"alle Wörter")
+        t_algo, t_match = st["match"].get(target, (None, ""))
+        if f.get("keep_match") == "1" and gone and t_algo in (1, 2):
+            words = t_match.split()
+            for s_ in srcs:
+                algo, m = st["match"].get(s_, (None, ""))
+                if names[s_] in gone and algo in (1, 2):
+                    words += [w for w in m.split() if w.lower() not in {x.lower() for x in words}]
+            if " ".join(words) != t_match:
+                try:
+                    pl.set_correspondent_match(target, " ".join(words))
+                    lines.append(f"Suchbegriffe für „{names[target]}“ ergänzt: {' '.join(words)}")
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"Suchbegriffe für „{names[target]}“: {e}")
+        if new_name and new_name != tname:
+            try:
+                pl.rename_correspondent(target, new_name)
+                renamed += 1
+                tname = f"{new_name} (vorher „{names[target]}“)"
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"Umbenennen von „{names[target]}“ nach „{new_name}“: {e}")
+        if gone or n_moved:
+            lines.append(f"{', '.join(gone) or '–'} → {tname}: {n_moved} Dokument(e) umgehängt, "
+                         f"{len(gone)} Korrespondent(en) gelöscht")
+        elif new_name and new_name != names[target]:
+            lines.append(f"„{names[target]}“ umbenannt in „{new_name}“")
+    gone_unused = []
+    for u in unused:
+        try:
+            if pl.doc_ids_of_correspondent(u):
+                errors.append(f"„{names[u]}“ hat inzwischen Dokumente – nicht gelöscht.")
+                continue
+            pl.delete_correspondent(u)
+            gone_unused.append(names[u])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"„{names[u]}“: {e}")
+    if gone_unused:
+        deleted += len(gone_unused)
+        lines.append(f"Unbenutzte gelöscht: {', '.join(gone_unused)}")
+    return page(CORR_RESULT, moved=moved, deleted=deleted, renamed=renamed, lines=lines, errors=errors)
 
 
 @app.route("/duplikate")
