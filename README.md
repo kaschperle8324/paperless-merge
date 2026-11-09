@@ -28,9 +28,26 @@ Erweiterung für **Paperless-ngx** mit zwei getrennten Bereichen:
 Die Erweiterung läuft als eigener Docker-Container neben Paperless und arbeitet ausschließlich über
 die Paperless-API. Paperless selbst wird nicht verändert.
 
+## Bilder
+*Alle Bilder zeigen frei erfundene Beispieldaten.*
+
+| Prüfseite: Rechnung + Lieferschein | Korrespondenten aufräumen |
+|---|---|
+| ![Prüfseite mit Zuordnungen](docs/bilder/2-pruefseite.png) | ![Korrespondenten aufräumen](docs/bilder/4-korrespondenten-aufraeumen.png) |
+| **Duplikate prüfen** | **Zusammengeführte Rechnungen prüfen (Dark Mode)** |
+| ![Duplikate](docs/bilder/5-duplikate.png) | ![Zusammengeführte prüfen](docs/bilder/3-zusammengefuehrte-pruefen-dunkel.png) |
+
+<details><summary>Weitere Bilder: Startseite, KI-Einstellungen, Handy</summary>
+
+![Startseite](docs/bilder/1-startseite.png)
+![KI-Einstellungen](docs/bilder/6-ki-einstellungen.png)
+<img src="docs/bilder/7-handy-dunkel.png" alt="Handy-Ansicht im Dark Mode" width="300">
+</details>
+
 ---
 
 ## Inhalt
+- [Bilder](#bilder)
 - [Voraussetzungen](#voraussetzungen)
 - [Installation](#installation)
 - [Aktualisieren](#aktualisieren)
