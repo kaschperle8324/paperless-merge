@@ -1,6 +1,6 @@
 # paperless-merge
 
-**Aktuelle Version: 1.2** · [Änderungen](#versionen)
+**Aktuelle Version: 1.2.1** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx** mit zwei getrennten Bereichen:
 
@@ -556,6 +556,9 @@ Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorra
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 1.2.1 (09.11.2026)
+- Fehlerbehebung: Die PDF-Bibliothek für Seitenvorschauen ist nicht threadsicher. Wurden während einer Prüfung gleichzeitig mehrere Seitenbilder geladen, konnte der Container abstürzen. Die Zugriffe laufen jetzt nacheinander.
 
 ### Version 1.2 (09.11.2026)
 - Oberfläche in zwei getrennte Bereiche aufgeteilt: **📎 Zusammenführen** (Rechnung + Lieferschein, Zusammengeführte prüfen) und **🧹 Aufräumen** (Übersicht, Korrespondenten, Duplikate) – jeweils mit Reitern

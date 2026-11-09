@@ -894,6 +894,10 @@ def _dhash(img, size=16):
     return bits
 
 
+# pdfium ist nicht threadsicher: alle Zugriffe (Prüfung im Hintergrund, Seitenvorschauen) nacheinander ausführen
+PDFIUM_LOCK = threading.Lock()
+
+
 def analyze_pdf(pdf_bytes):
     """Liefert je Seite: Text, Lieferscheinnummern und Bild-Hash."""
     import pypdf
@@ -905,18 +909,19 @@ def analyze_pdf(pdf_bytes):
             texts.append(p.extract_text() or "")
         except Exception:  # noqa: BLE001
             texts.append("")
-    pdf = pdfium.PdfDocument(pdf_bytes)
     pages = []
-    try:
-        for i in range(len(pdf)):
-            page = pdf[i]
-            w = page.get_width() or 595
-            img = page.render(scale=120 / w).to_pil()
-            t = texts[i] if i < len(texts) else ""
-            pages.append({"n": i + 1, "text": _norm_page_text(t), "nums": sorted(extract_numbers(t)),
-                          "hash": _dhash(img)})
-    finally:
-        pdf.close()
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        try:
+            for i in range(len(pdf)):
+                page = pdf[i]
+                w = page.get_width() or 595
+                img = page.render(scale=120 / w).to_pil()
+                t = texts[i] if i < len(texts) else ""
+                pages.append({"n": i + 1, "text": _norm_page_text(t), "nums": sorted(extract_numbers(t)),
+                              "hash": _dhash(img)})
+        finally:
+            pdf.close()
     return pages
 
 
@@ -2925,14 +2930,15 @@ def audit_page(job_id, doc_id, n):
         if not os.path.exists(src):
             abort(404)
         import pypdfium2 as pdfium
-        pdf = pdfium.PdfDocument(src)
-        try:
-            if not 1 <= n <= len(pdf):
-                abort(404)
-            pg = pdf[n - 1]
-            pg.render(scale=260 / (pg.get_width() or 595)).to_pil().save(png, "PNG")
-        finally:
-            pdf.close()
+        with PDFIUM_LOCK:
+            pdf = pdfium.PdfDocument(src)
+            try:
+                if not 1 <= n <= len(pdf):
+                    abort(404)
+                pg = pdf[n - 1]
+                pg.render(scale=260 / (pg.get_width() or 595)).to_pil().save(png, "PNG")
+            finally:
+                pdf.close()
     with open(png, "rb") as f:
         return Response(f.read(), content_type="image/png", headers={"Cache-Control": "max-age=3600"})
 
