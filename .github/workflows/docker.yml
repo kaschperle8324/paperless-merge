@@ -37,6 +37,7 @@ jobs:
             type=raw,value=${{ steps.ver.outputs.version }}
           labels: |
             org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
 
       - uses: docker/build-push-action@v6
         with:

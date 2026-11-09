@@ -656,4 +656,11 @@ Erste versionierte Ausgabe mit folgenden Funktionen:
 - modernes Design mit Dark Mode, volle Bildschirmbreite, Versionsanzeige
 
 ## Lizenz
-Siehe [LICENSE](LICENSE).
+paperless-merge steht unter der **GNU General Public License v3.0** (oder einer späteren Version) – derselben Lizenz
+wie Paperless-ngx. Den vollständigen Text enthält die Datei [LICENSE](LICENSE).
+
+Kurz gesagt: Die Erweiterung darf frei genutzt, verändert und weitergegeben werden. Wer eine veränderte Fassung
+weitergibt, muss sie ebenfalls unter der GPL-3.0 mit Quellcode veröffentlichen. Es gibt keine Gewährleistung.
+
+Verwendete Bibliotheken und ihre Lizenzen: Flask, pypdf (BSD-3-Clause), requests, pypdfium2/PDFium (Apache-2.0
+bzw. BSD-3-Clause), gunicorn (MIT), Pillow (MIT-CMU) – alle mit der GPL-3.0 vereinbar.
