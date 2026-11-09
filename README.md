@@ -1,19 +1,19 @@
 # paperless-merge
 
-**Aktuelle Version: 1.2.1** · [Änderungen](#versionen)
+**Aktuelle Version: 1.3** · [Änderungen](#versionen)
 
 Erweiterung für **Paperless-ngx** mit zwei getrennten Bereichen:
 
 - **📎 Zusammenführen** – findet Rechnungen und die dazugehörigen Lieferscheine und führt sie zu **einem PDF** zusammen
 - **🧹 Aufräumen** – hält den Bestand sauber: doppelte/ähnliche **Korrespondenten** zusammenführen und **doppelte Dokumente** entfernen
 
-**Zusammenführen**
-
-- **Rechnung immer als erste Seite**, danach die Lieferscheine nach Datum
-- das neue Dokument läuft als Dokumententyp **Rechnung**, übernimmt Korrespondent und Speicherpfad der Rechnung
-  sowie **alle Tags der Rechnung und der zugehörigen Lieferscheine**
+**Zusammenführen** – in zwei wählbaren Modi:
+- **📎 Rechnung + Lieferscheine in ein Dokument:** Rechnung als erste Seite, danach die Lieferscheine nach Datum; das neue
+  Dokument läuft als Typ **Rechnung** und übernimmt Korrespondent, Speicherpfad und **alle Tags** von Rechnung und Lieferscheinen
+- **🗂 Nur Lieferscheine bündeln:** die **Rechnung bleibt im Original** unverändert; die Lieferscheine einer Rechnung werden zu
+  einem Dokument „Lieferscheine zu …“ zusammengefasst und per **Dokumentverknüpfung** mit der Rechnung verbunden
 - **nichts passiert ohne Kontrolle** – alle Zuordnungen werden vorher auf einer Prüfseite angezeigt
-- **keine Duplikate** – nach jedem Durchlauf bleibt in Paperless jede Rechnung genau einmal übrig, mit jedem zugehörigen Lieferschein genau einmal darin
+- **keine Duplikate** – nach jedem Durchlauf liegt in Paperless jede Rechnung genau einmal und jeder Lieferschein genau einmal vor
 - frei wählbarer **Zeitraum**, Auswahl der **Korrespondenten** und der **Tags** für die neuen Dokumente
 - OCR-tolerante Erkennung der Lieferscheinnummer (z. B. `LI` ↔ `11`)
 - **Suche in der ganzen Paperless-Instanz** nach Rechnungen zu Lieferscheinen, die nicht zugeordnet werden konnten
@@ -172,6 +172,8 @@ Auf der Startseite werden nur Einstellungen getroffen – **es wird noch nichts 
 | Rechnungsdatum von / bis | Es werden Rechnungen mit Dokumentdatum in diesem Zeitraum gesucht. Vorbelegt: Anfang des Vormonats bis heute. |
 | Lieferscheine zusätzlich Tage vorher | Lieferscheine liegen meist vor der Rechnung. Hier wird festgelegt, wie viele Tage vor dem Startdatum noch Lieferscheine berücksichtigt werden (Standard 60). |
 | 🤖 KI-Unterstützung nutzen | Nur sichtbar, wenn Texterkennung oder Auswertung unter **⚙ Einstellungen** eingerichtet ist – siehe [KI-Unterstützung](#ki-unterstützung). Standard: an. |
+| Ergebnis (Modus) | **📎 Rechnung + Lieferscheine in ein Dokument** oder **🗂 Nur Lieferscheine bündeln – Rechnung bleibt im Original**. Siehe [Was mit den Originalen passiert](#was-mit-den-originalen-passiert). Vorauswahl über `DEFAULT_MODE`. |
+| Rechnung mit Tag „LS-ergänzt“ markieren | Nur im Modus *bündeln*: Die Rechnung bekommt das Tag, damit sie beim nächsten Lauf nicht erneut angeboten wird (empfohlen). Ihr PDF und Inhalt bleiben unverändert. |
 | Bereits ergänzte Rechnungen ausblenden | Rechnungen, die schon mit Lieferscheinen zusammengeführt wurden, werden nicht erneut angeboten – siehe [Schutz vor doppeltem Zusammenführen](#schutz-vor-doppeltem-zusammenführen). Standard: an. |
 
 **Korrespondenten**
@@ -427,8 +429,11 @@ Oben auf der Prüfseite steht, wie viele Dokumente neu erkannt, Nummern ergänzt
   (*eigene Adresse*, z. B. `http://192.168.1.60:11434/v1`).
 
 ## Was mit den Originalen passiert
-Nach jedem Zusammenführen – egal ob von der Prüfseite oder aus der Lieferschein-Suche – bleibt in Paperless
-**nur das neue Dokument** übrig: die Rechnung mit allen zugehörigen Lieferscheinen, jeder genau einmal.
+Auf der Startseite wird gewählt, wie gearbeitet wird. Der Modus gilt für den ganzen Durchlauf – auch für die
+[Lieferschein-Suche](#4-rechnungen-zu-lieferscheinen-suchen). Beide Modi lassen sich jederzeit abwechselnd nutzen.
+
+### Modus 📎 „Rechnung + Lieferscheine in ein Dokument“
+Übrig bleibt **nur das neue Dokument**: die Rechnung mit allen zugehörigen Lieferscheinen, jeder genau einmal.
 
 | | danach |
 |---|---|
@@ -436,8 +441,25 @@ Nach jedem Zusammenführen – egal ob von der Prüfseite oder aus der Liefersch
 | Lieferscheine | bekommen vorher das Tag **`LS-zugeordnet`** – werden sie aus dem Papierkorb wiederhergestellt, werden sie trotzdem nicht erneut verwendet |
 | neues Dokument | Typ *Rechnung*, Titel, Datum, Korrespondent, Speicherpfad und ASN der Rechnung, alle Tags (siehe unten) und das Tag **`LS-ergänzt`** |
 
+### Modus 🗂 „Nur Lieferscheine bündeln – Rechnung bleibt im Original“
+Die **Rechnung wird nicht verändert** – ihr PDF, Inhalt und Titel bleiben, wie sie sind. Stattdessen entsteht je Rechnung
+ein **Lieferschein-Bündel**:
+
+| | danach |
+|---|---|
+| Rechnung | bleibt im Original. Sie bekommt nur das Tag **`LS-ergänzt`** (abschaltbar) und – automatisch durch Paperless – den Rückverweis auf das Bündel im Feld *Rechnung ↔ Lieferscheine*. |
+| Lieferschein-Bündel | **ein Dokument** mit allen Lieferscheinen der Rechnung (nach Datum), Typ *Lieferschein*, Titel **„Lieferscheine zu &lt;Titel der Rechnung&gt;“**, alle Tags der Lieferscheine plus die gewählten Zusatz-Tags sowie **`LS-zugeordnet`** und **`LS-Sammlung`** |
+| Verweis | Feld **„Rechnung ↔ Lieferscheine“** (Paperless-Dokumentverknüpfung) – in Paperless anklickbar, in beide Richtungen: vom Bündel zur Rechnung und von der Rechnung zum Bündel. Das Feld wird bei Bedarf automatisch angelegt. |
+| Lieferschein-Originale | wandern in den **Papierkorb** (dort wiederherstellbar) |
+| nur **ein** Lieferschein | wird nicht zusammengeführt, sondern nur umbenannt („Lieferscheine zu …“), getaggt und verknüpft |
+
+Hinweise:
+- Der Verweis wird gesetzt, sobald Paperless das Bündel angelegt hat (die Erweiterung wartet dafür bis zu 5 Minuten im Hintergrund).
+- Beim nächsten Lauf wird eine Rechnung mit Bündel nicht erneut angeboten – erkannt am Tag `LS-ergänzt` **oder** an der Verknüpfung.
+- Gebündelte Lieferscheine werden auch von [*Zusammengeführte prüfen*](#5-zusammengeführte-rechnungen-prüfen-und-korrigieren) auf doppelte Seiten geprüft.
+
 ### Tags des neuen Dokuments
-Das zusammengeführte Dokument bekommt **alle Tags zusammen**:
+Im Modus 📎 bekommt das zusammengeführte Dokument **alle Tags zusammen**:
 1. die Tags der **Rechnung**,
 2. die Tags **aller zugehörigen Lieferscheine**,
 3. die auf der Startseite gewählten **Zusatz-Tags** (z. B. *Posteingang*).
@@ -508,7 +530,10 @@ Alle Einstellungen werden als Umgebungsvariablen in der `docker-compose.yml` ges
 | `DOCTYPE_DELIVERY` | `Lieferschein` | Name des Dokumententyps für Lieferscheine |
 | `DEFAULT_TAGS` | `Posteingang` | vorausgewählte Tags für neue Dokumente, mehrere durch Komma getrennt |
 | `DONE_TAG` | `LS-zugeordnet` | Tag für bereits verwendete Lieferscheine (wird bei Bedarf automatisch angelegt) |
-| `MERGED_TAG` | `LS-ergänzt` | Tag für Rechnungen, an die Lieferscheine angehängt wurden (wird bei Bedarf automatisch angelegt) |
+| `MERGED_TAG` | `LS-ergänzt` | Tag für Rechnungen, an die Lieferscheine angehängt bzw. deren Lieferscheine gebündelt wurden (wird bei Bedarf automatisch angelegt) |
+| `BUNDLE_TAG` | `LS-Sammlung` | Tag für Lieferschein-Bündel (Modus *bündeln*) |
+| `LINK_FIELD` | `Rechnung ↔ Lieferscheine` | Name des Paperless-Felds (Dokumentverknüpfung) zwischen Bündel und Rechnung |
+| `DEFAULT_MODE` | `merge` | Vorauswahl auf der Startseite: `merge` (in ein Dokument) oder `bundle` (nur Lieferscheine bündeln) |
 | `FALLBACK_DAYS` | `45` | Zeitfenster für *unsichere* Vorschläge: Lieferschein max. so viele Tage vor der Rechnung |
 | `DEFAULT_LOOKBACK_DAYS` | `60` | Vorbelegung für „Lieferscheine zusätzlich Tage vorher“ |
 | `VERIFY_SSL` | `true` | bei HTTPS mit selbstsigniertem Zertifikat auf `false` setzen |
@@ -573,6 +598,13 @@ Gesetzte Variablen dienen als Vorbelegung, Werte aus der Oberfläche haben Vorra
 ## Versionen
 Die Versionsnummer steht in der Datei `VERSION`, oben rechts in der Oberfläche, im Image-Tag
 (`ghcr.io/kaschperle8324/paperless-merge:<version>`) und als Release auf GitHub.
+
+### Version 1.3 (09.11.2026)
+- neuer Modus **🗂 Nur Lieferscheine bündeln – Rechnung bleibt im Original**: die Lieferscheine einer Rechnung werden zu einem Dokument „Lieferscheine zu …“ zusammengefasst, die Rechnung bleibt unverändert
+- Verweis zwischen Bündel und Rechnung über die Paperless-Dokumentverknüpfung „Rechnung ↔ Lieferscheine“ (in beide Richtungen anklickbar), neues Tag `LS-Sammlung`
+- Modus auf der Startseite wählbar (Vorauswahl über `DEFAULT_MODE`), gilt auch für die Lieferschein-Suche
+- Rechnungen mit Bündel werden beim nächsten Lauf nicht erneut angeboten (Tag oder Verknüpfung)
+- *Zusammengeführte prüfen* prüft auch gebündelte Lieferscheine
 
 ### Version 1.2.1 (09.11.2026)
 - Fehlerbehebung: Die PDF-Bibliothek für Seitenvorschauen ist nicht threadsicher. Wurden während einer Prüfung gleichzeitig mehrere Seitenbilder geladen, konnte der Container abstürzen. Die Zugriffe laufen jetzt nacheinander.

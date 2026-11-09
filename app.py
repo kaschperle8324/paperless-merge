@@ -51,6 +51,9 @@ TYPE_INVOICE = os.environ.get("DOCTYPE_INVOICE", "Rechnung")
 TYPE_DELIVERY = os.environ.get("DOCTYPE_DELIVERY", "Lieferschein")
 DONE_TAG = os.environ.get("DONE_TAG", "LS-zugeordnet")          # an verwendeten Lieferscheinen
 MERGED_TAG = os.environ.get("MERGED_TAG", "LS-ergänzt")          # an Rechnungen mit ergänzten Lieferscheinen
+BUNDLE_TAG = os.environ.get("BUNDLE_TAG", "LS-Sammlung")         # an gebündelten Lieferscheinen (Modus "bündeln")
+LINK_FIELD = os.environ.get("LINK_FIELD", "Rechnung ↔ Lieferscheine")  # Dokumentverknüpfung Bündel <-> Rechnung
+DEFAULT_MODE = os.environ.get("DEFAULT_MODE", "merge").strip().lower()  # merge | bundle
 DEFAULT_TAGS = [t.strip().lower() for t in os.environ.get("DEFAULT_TAGS", "Posteingang").split(",") if t.strip()]
 FALLBACK_DAYS = int(os.environ.get("FALLBACK_DAYS", "45"))
 DEFAULT_LOOKBACK = int(os.environ.get("DEFAULT_LOOKBACK_DAYS", "60"))
@@ -137,6 +140,30 @@ class Paperless:
             {"documents": list(doc_ids), "method": "delete", "parameters": {}},
         )
 
+    def ensure_link_field(self, name):
+        """Benutzerdefiniertes Feld vom Typ Dokumentverknüpfung (wird bei Bedarf angelegt)."""
+        res = self.all("/api/custom_fields/", name__iexact=name)
+        if res:
+            return res[0]["id"]
+        return self.send("POST", "/api/custom_fields/", {"name": name, "data_type": "documentlink"})["id"]
+
+    def set_doc_link(self, doc_id, field_id, target_ids):
+        """Setzt eine Dokumentverknüpfung; vorhandene Felder bleiben erhalten (Paperless entfernt sonst
+        alle nicht mitgeschickten Felder). Paperless legt den Rückverweis am Ziel automatisch an."""
+        doc = self.get(f"/api/documents/{doc_id}/").json()
+        fields = [{"field": f["field"], "value": f.get("value")} for f in doc.get("custom_fields") or []
+                  if f["field"] != field_id]
+        fields.append({"field": field_id, "value": list(target_ids)})
+        return self.send("PATCH", f"/api/documents/{doc_id}/", {"custom_fields": fields})
+
+    def find_bundle(self, title, type_id, exclude_ids):
+        docs = self.all("/api/documents/", document_type__id=type_id, title__icontains=title,
+                        fields="id,title,original_file_name", ordering="-id")
+        for d in docs:
+            if d["id"] not in exclude_ids and str(d.get("original_file_name") or "").lower().endswith("_merged.pdf"):
+                return d
+        return None
+
     def download(self, doc_id, original=False):
         """PDF eines Dokuments (Archivversion mit Textebene, wenn vorhanden)."""
         r = self.s.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/",
@@ -181,7 +208,8 @@ class Paperless:
             "created__gte": start.isoformat(),
             "created__lt": (end + dt.timedelta(days=1)).isoformat(),
             "ordering": "created",
-            "fields": "id,title,correspondent,created,content,tags,archive_serial_number,original_file_name",
+            "fields": "id,title,correspondent,created,content,tags,archive_serial_number,original_file_name,"
+                      "custom_fields",
         }
         if exclude_tag:
             params["tags__id__none"] = exclude_tag
@@ -366,10 +394,13 @@ def contains_number(haystack_upper, num):
     return False
 
 
-def is_merged_doc(doc, merged_tag_id=None):
-    """Rechnung wurde schon mit Lieferscheinen zusammengeführt: Tag gesetzt oder von Paperless
-    erzeugte Merge-Datei (Dateiname "<ids>_merged.pdf")."""
+def is_merged_doc(doc, merged_tag_id=None, link_field_id=None):
+    """Rechnung ist schon erledigt: Tag gesetzt, von Paperless erzeugte Merge-Datei (Dateiname "<ids>_merged.pdf")
+    oder – im Modus "bündeln" – mit gebündelten Lieferscheinen verknüpft."""
     if merged_tag_id and merged_tag_id in (doc.get("tags") or []):
+        return True
+    if link_field_id and any(f.get("field") == link_field_id and f.get("value")
+                             for f in doc.get("custom_fields") or []):
         return True
     return str(doc.get("original_file_name") or "").lower().endswith("_merged.pdf")
 
@@ -981,9 +1012,14 @@ def _run_audit(job_id, start, end, use_ocr=False):
     try:
         pl = Paperless()
         t_inv = pl.id_by_name("/api/document_types/", TYPE_INVOICE)
+        t_ls = pl.id_by_name("/api/document_types/", TYPE_DELIVERY)
         merged_tag = pl.id_by_name("/api/tags/", MERGED_TAG)
         corr = pl.correspondents()
-        docs = [d for d in pl.find_docs({t_inv} if t_inv else set(), start, end) if is_merged_doc(d, merged_tag)]
+        types = {t for t in (t_inv, t_ls) if t}
+        # zusammengeführte Rechnungen und gebündelte Lieferscheine (Merge-Datei von Paperless)
+        docs = [d for d in pl.find_docs(types, start, end)
+                if (d.get("document_type") == t_inv and is_merged_doc(d, merged_tag))
+                or str(d.get("original_file_name") or "").lower().endswith("_merged.pdf")]
         docs.sort(key=lambda d: str(d.get("created")), reverse=True)
         if len(docs) > AUDIT_MAX_DOCS:
             job["truncated"] = len(docs)
@@ -1553,6 +1589,9 @@ details .groups{margin-top:14px}
 .bar{position:sticky;bottom:14px;display:flex;gap:10px;align-items:center;justify-content:space-between;
   background:color-mix(in srgb,var(--surface) 90%,transparent);backdrop-filter:blur(10px)}
 a{color:var(--accent)}
+.mode{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:12px;margin-top:8px;cursor:pointer}
+.mode:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+.mode input{margin-top:3px;accent-color:var(--accent);width:18px;height:18px;flex:none}
 .ctab{width:100%;border-collapse:collapse;margin-top:10px;font-size:.9rem}
 .ctab th{text-align:left;font-size:.75rem;color:var(--muted);font-weight:600;padding:4px 6px;border-bottom:1px solid var(--line)}
 .ctab td{padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
@@ -1662,8 +1701,17 @@ INDEX = """
      <div><label class="f">Lieferscheine zusätzlich Tage vorher</label>
        <input type="number" name="lookback" value="{{ lookback }}" min="0" max="365"></div>
    </div>
-   <p class="meta">Nach dem Zusammenführen bleibt in Paperless nur das neue Dokument übrig – Rechnung und Lieferscheine
-     wandern in den Papierkorb (dort wiederherstellbar). So entstehen keine Duplikate.</p>
+   <label class="f" style="margin-top:16px">Ergebnis</label>
+   <label class="mode"><input type="radio" name="mode" value="merge" {{ 'checked' if default_mode != 'bundle' }}>
+     <span><b>📎 Rechnung + Lieferscheine in ein Dokument</b><br>
+     <span class="meta">Rechnung als erste Seite, danach die Lieferscheine. Rechnung und Lieferscheine wandern in den
+       Papierkorb – übrig bleibt nur das neue Dokument.</span></span></label>
+   <label class="mode"><input type="radio" name="mode" value="bundle" {{ 'checked' if default_mode == 'bundle' }}>
+     <span><b>🗂 Nur Lieferscheine bündeln – Rechnung bleibt im Original</b><br>
+     <span class="meta">Die Lieferscheine einer Rechnung werden zu einem Dokument „Lieferscheine zu …“ zusammengefasst und
+       mit der Rechnung verknüpft. Die Rechnung selbst (PDF und Inhalt) bleibt unverändert.</span></span></label>
+   <label class="switch" id="markinv" style="margin-left:30px" {{ '' if default_mode == 'bundle' else 'hidden' }}>
+     <input type="checkbox" name="mark_invoice" value="1" checked> Rechnung mit Tag „{{ merged_tag }}“ markieren (empfohlen)</label>
    <label class="switch"><input type="checkbox" name="hide_merged" value="1" checked>
      Bereits ergänzte Rechnungen ausblenden</label>
    {% if ai.enabled or ocr.enabled %}<label class="switch"><input type="checkbox" name="use_ai" value="1" checked>
@@ -1692,7 +1740,7 @@ INDEX = """
 
   <section>
    <h3>Tags für die neuen Dokumente</h3>
-   <p class="meta" style="margin:0">Zusätzlich zu den Tags der Rechnung. Anklicken zum An-/Abwählen.</p>
+   <p class="meta" style="margin:0">Zusätzlich zu den vorhandenen Tags – im Modus 🗂 bekommt sie das Lieferschein-Bündel. Anklicken zum An-/Abwählen.</p>
    {% if tags %}
    {% if tags|length > 12 %}<input type="search" class="filter" data-target="tagchips" placeholder="Tag suchen …" style="margin-top:10px">{% endif %}
    <div class="chips" id="tagchips">
@@ -1713,6 +1761,8 @@ INDEX = """
   <span class="meta">Entfernt nachträglich jedes „(merged)“ aus allen Dokumenttiteln in Paperless – auch mehrfache.</span>
 </form>
 <script>
+document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', () =>
+  document.getElementById('markinv').hidden = document.querySelector('input[name=mode]:checked').value !== 'bundle'));
 document.querySelectorAll('input.filter').forEach(f=>f.addEventListener('input',()=>{const q=f.value.toLowerCase();
   document.querySelectorAll('#'+f.dataset.target+' .chip').forEach(c=>c.style.display=c.dataset.name.includes(q)||c.querySelector('input').checked?'':'none')}));
 document.querySelectorAll('[data-clear]').forEach(b=>b.addEventListener('click',()=>
@@ -1745,11 +1795,15 @@ PREVIEW = """
     zusammengeführt. Aufräumen über <a href="{{ url_for('dups') }}">🧹 Duplikate</a>.</p>{% endif %}
   <div>
   </div>
-  Originale: <b>werden nach dem Zusammenführen in den Papierkorb verschoben</b><br>
+  {% if mode == 'bundle' %}Ergebnis: <b>🗂 nur Lieferscheine bündeln – Rechnungen bleiben im Original</b><br>
+  {% else %}Ergebnis: <b>📎 Rechnung + Lieferscheine in ein Dokument</b> – Originale in den Papierkorb<br>{% endif %}
   Korrespondenten: {% for c in sel_corrs %}<span class="pill tag">{{ c }}</span>{% else %}<span class="meta">alle</span>{% endfor %}<br>
   Zusätzliche Tags: {% for t in extra_tags %}<span class="pill" style="background:{{ t.color or '#6366f1' }};color:{{ t.text_color or '#fff' }}">{{ t.name }}</span>{% else %}<span class="meta">keine</span>{% endfor %}
-  <p class="meta">Reihenfolge im neuen PDF: Rechnung zuerst, danach die Lieferscheine nach Datum.
-  Das neue Dokument übernimmt Titel, Korrespondent und Dokumententyp „{{ type_invoice }}“ der Rechnung sowie <b>alle Tags der Rechnung und der zugehörigen Lieferscheine</b>.
+  {% if mode == 'bundle' %}<p class="meta">Je Rechnung entsteht ein Dokument <b>„Lieferscheine zu &lt;Rechnung&gt;“</b> (Typ Lieferschein,
+  Lieferscheine nach Datum, alle Tags der Lieferscheine) mit Verweis auf die Rechnung; die Lieferschein-Originale wandern in den
+  Papierkorb. Die Rechnung bleibt im Original{% if mark_invoice %} und bekommt nur das Tag „LS-ergänzt“{% endif %}.
+  {% else %}<p class="meta">Reihenfolge im neuen PDF: Rechnung zuerst, danach die Lieferscheine nach Datum.
+  Das neue Dokument übernimmt Titel, Korrespondent und Dokumententyp „{{ type_invoice }}“ der Rechnung sowie <b>alle Tags der Rechnung und der zugehörigen Lieferscheine</b>.{% endif %}
   <span class="badge sicher">sicher</span> Nummer gefunden ·
   <span class="badge mittel">mittel</span> Nummer gefunden, aber Auffälligkeit ·
   <span class="badge unsicher">unsicher</span> nur Korrespondent/Datum, standardmäßig abgewählt ·
@@ -1825,7 +1879,7 @@ PREVIEW = """
 {% endif %}
 
 <div class="card bar"><a class="btn sec" href="{{ url_for('index') }}">← Abbrechen</a>
-  <button type="submit">3 · Ausgewählte zusammenführen</button></div>
+  <button type="submit">3 · {{ 'Lieferscheine bündeln' if mode == 'bundle' else 'Ausgewählte zusammenführen' }}</button></div>
 </form>
 <script>
 document.querySelectorAll('.ls,.add').forEach(el => el.addEventListener('change', () => {
@@ -1855,7 +1909,7 @@ document.getElementById('f').addEventListener('submit', e => {
     if (ls + (add ? add.selectedOptions.length : 0) > 0) n++;
   });
   if (!n) { alert('Nichts ausgewählt.'); e.preventDefault(); return; }
-  if (!confirm(n + ' Rechnung(en) jetzt mit ihren Lieferscheinen zusammenführen?')) e.preventDefault();
+  if (!confirm({{ "'Lieferscheine zu ' + n + ' Rechnung(en) jetzt bündeln? Die Rechnungen bleiben unverändert.'" if mode == 'bundle' else "n + ' Rechnung(en) jetzt mit ihren Lieferscheinen zusammenführen?'" }})) e.preventDefault();
 });
 </script>
 """
@@ -1929,8 +1983,8 @@ SEARCH = """
 </div>
 {% endfor %}
 </div>
-<div class="card bar"><span class="meta">Rechnung zuerst, danach die Lieferscheine – Tags wie auf der Startseite gewählt, Originale in den Papierkorb.</span>
-  <button type="submit">Ausgewählte zusammenführen</button></div>
+<div class="card bar"><span class="meta">{% if mode == 'bundle' %}Lieferscheine werden gebündelt und mit der Rechnung verknüpft – die Rechnung bleibt im Original.{% else %}Rechnung zuerst, danach die Lieferscheine – Tags wie auf der Startseite gewählt, Originale in den Papierkorb.{% endif %}</span>
+  <button type="submit">{{ 'Lieferscheine bündeln' if mode == 'bundle' else 'Ausgewählte zusammenführen' }}</button></div>
 </form>
 <script>
 document.getElementById('sf').addEventListener('submit', e => {
@@ -2361,7 +2415,7 @@ RESULT = """
 <div class="card {{ 'err' if errors else 'ok' }}"><h3>✓ Ergebnis</h3>
   {{ done|length }} Zusammenführung(en) an Paperless übergeben{% if errors %}, {{ errors|length }} Fehler{% endif %}.
   <p class="meta">Paperless verarbeitet die neuen PDFs im Hintergrund – sie erscheinen nach kurzer Zeit.</p></div>
-{% for d in done %}<div class="card">✔ {{ d.title }} + {{ d.count }} Lieferschein(e)</div>{% endfor %}
+{% for d in done %}<div class="card">✔ {% if d.bundle %}{{ d.title }}: {{ d.count }} Lieferschein(e) gebündelt, Rechnung unverändert{% else %}{{ d.title }} + {{ d.count }} Lieferschein(e){% endif %}</div>{% endfor %}
 {% for e in errors %}<div class="card err">✘ {{ e }}</div>{% endfor %}
 <div class="card">
   {% if auto_clean %}<p class="meta" style="margin-top:0">Der Titelzusatz „(merged)“ wird automatisch entfernt,
@@ -2418,7 +2472,7 @@ def index(error=None):
         error = error or f"Tags/Korrespondenten konnten nicht geladen werden: {e}"
     return page(INDEX, error=error, start=first_prev.isoformat(), end=today.isoformat(),
                 lookback=DEFAULT_LOOKBACK, done_tag=DONE_TAG, merged_tag=MERGED_TAG, tags=tags, corrs=corrs,
-                ai=ai_cfg(), ocr=ocr_cfg())
+                ai=ai_cfg(), ocr=ocr_cfg(), default_mode=DEFAULT_MODE)
 
 
 @app.route("/preview", methods=["POST"])
@@ -2437,6 +2491,8 @@ def preview():
     corr_ids = {int(x) for x in request.form.getlist("corr") if x.isdigit()}
     corr_none = request.form.get("corr_none") == "1"
     hide_merged = request.form.get("hide_merged") == "1"
+    mode = "bundle" if request.form.get("mode") == "bundle" else "merge"
+    mark_invoice = request.form.get("mark_invoice") == "1"
     use_ai = (ai_cfg()["enabled"] or ocr_cfg()["enabled"]) and request.form.get("use_ai") == "1"
 
     try:
@@ -2456,8 +2512,12 @@ def preview():
             deliveries = [d for d in deliveries if d.get("correspondent") is not None]
         corr = pl.correspondents()
         merged_tag = pl.id_by_name("/api/tags/", MERGED_TAG)
+        try:
+            link_field = pl.id_by_name("/api/custom_fields/", LINK_FIELD)
+        except Exception:  # noqa: BLE001
+            link_field = None
         for d in invoices:
-            d["_merged"] = is_merged_doc(d, merged_tag)
+            d["_merged"] = is_merged_doc(d, merged_tag, link_field)
         orig_dups, ls_dups = mark_already_merged(invoices, deliveries)
         wanted = {int(x) for x in request.form.getlist("tags") if x.isdigit()}
         extra_tags = [t for t in pl.tags() if t["id"] in wanted] if wanted else []
@@ -2478,7 +2538,8 @@ def preview():
     plan["without"] = [g for g in plan["without"] if g["inv"]["date"] <= end.isoformat()]
 
     plan_id = uuid.uuid4().hex
-    stored = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals,
+    stored = {"ts": time.time(), "plan": plan, "delete_originals": delete_originals, "mode": mode,
+              "mark_invoice": mark_invoice,
               "extra_tags": [t["id"] for t in extra_tags],
               "view": {"start": start, "end": end, "extra_tags": extra_tags, "ai_stats": ai_stats,
                        "sel_corrs": [corr.get(c, f"#{c}") for c in
@@ -2493,7 +2554,8 @@ def render_review(plan_id, stored, open_unassigned=False, info=None):
     return page(PREVIEW, plan=stored["plan"], plan_id=plan_id, start=v["start"], end=v["end"],
                 delete_originals=stored["delete_originals"], public=PAPERLESS_PUBLIC_URL, link=doc_link,
                 type_invoice=TYPE_INVOICE, extra_tags=v["extra_tags"], sel_corrs=v["sel_corrs"],
-                open_unassigned=open_unassigned, done_tag=DONE_TAG, info=info, ai_stats=v.get("ai_stats"))
+                open_unassigned=open_unassigned, done_tag=DONE_TAG, info=info, ai_stats=v.get("ai_stats"),
+                mode=stored.get("mode", "merge"), mark_invoice=stored.get("mark_invoice", True))
 
 
 def _get_plan(plan_id):
@@ -2578,6 +2640,7 @@ def search_ls():
         nums = {l["id"]: [x["n"] for x in l.get("nums", [])] for l in lss}
 
     ctx = dict(plan_id=plan_id, lss=lss, nums=nums, types=types, sel_types=sel_types, before=before,
+               mode=stored.get("mode", "merge"),
                after=after, unlimited=unlimited, same_corr=same_corr, link=doc_link, results=None, sid=None,
                error=None)
     if not run:
@@ -2612,7 +2675,8 @@ def search_ls():
     with PLANS_LOCK:
         PLANS[sid] = {"ts": time.time(), "search": True, "plan_id": plan_id, "docs": docs,
                       "ls": {l["id"]: l for l in lss},
-                      "delete_originals": stored["delete_originals"], "extra_tags": stored["extra_tags"]}
+                      "delete_originals": stored["delete_originals"], "extra_tags": stored["extra_tags"],
+                      "mode": stored.get("mode", "merge"), "mark_invoice": stored.get("mark_invoice", True)}
     ctx.update(results=results, sid=sid)
     return page(SEARCH, **ctx)
 
@@ -2633,7 +2697,10 @@ def search_merge():
             for doc_id, lids in targets.items()]
     if not jobs:
         return index(error="Es wurde keine Rechnung ausgewählt.")
-    done, errors = perform_merges(jobs, st["ls"], st["delete_originals"], st["extra_tags"])
+    if st.get("mode") == "bundle":
+        done, errors = perform_bundles(jobs, st["ls"], st["extra_tags"], st.get("mark_invoice", True))
+    else:
+        done, errors = perform_merges(jobs, st["ls"], st["delete_originals"], st["extra_tags"])
 
     # verwendete Lieferscheine aus der Prüfseite entfernen; betroffene Rechnungen dort sperren
     merged_ls = {lid for _, lids in jobs for lid in lids}
@@ -2649,6 +2716,80 @@ def search_merge():
                 PLANS.pop(st["plan_id"], None)  # Rechnung hat sich geändert -> Prüfseite neu erstellen
     return page(RESULT, done=done, errors=errors, auto_clean=AUTO_CLEAN_TITLES,
                 back=st["plan_id"] if st["plan_id"] in PLANS else None)
+
+
+def bundle_title(inv):
+    return f"Lieferscheine zu {clean_title(inv['title'])}"
+
+
+def perform_bundles(jobs, known_ls, extra, mark_invoice=True):
+    """Modus "nur Lieferscheine bündeln": Die Rechnung bleibt im Original. Die Lieferscheine einer Rechnung werden
+    zu einem Dokument zusammengeführt (Typ Lieferschein), das den Titel "Lieferscheine zu <Rechnung>" und eine
+    Dokumentverknüpfung zur Rechnung bekommt. jobs: [(rechnung_summary, [lieferschein_ids])]."""
+    pl = Paperless()
+    done, errors, pending = [], [], []
+    try:
+        done_tag_id = pl.ensure_tag(DONE_TAG)
+        merged_tag_id = pl.ensure_tag(MERGED_TAG) if mark_invoice else None
+        bundle_tag_id = pl.ensure_tag(BUNDLE_TAG)
+    except Exception as e:  # noqa: BLE001
+        return [], [f"Tags konnten nicht angelegt werden: {e}"]
+    try:
+        link_field = pl.ensure_link_field(LINK_FIELD)
+    except Exception as e:  # noqa: BLE001
+        link_field = None
+        errors.append(f"Feld „{LINK_FIELD}“ für den Verweis konnte nicht angelegt werden ({e}) – "
+                      "die Lieferscheine werden trotzdem gebündelt.")
+    t_ls = pl.id_by_name("/api/document_types/", TYPE_DELIVERY)
+    for inv, ls_ids in jobs:
+        ls_ids = sorted(ls_ids, key=lambda x: (known_ls[x]["date"], x))
+        first = ls_ids[0]
+        title = bundle_title(inv)
+        add = []
+        for t in [*(t for lid in ls_ids for t in known_ls[lid].get("tags", [])), *extra, done_tag_id, bundle_tag_id]:
+            if t not in add and t != merged_tag_id:
+                add.append(t)
+        try:
+            pl.modify_tags(ls_ids, add=[done_tag_id])
+            pl.modify_tags([first], add=add)
+            pl.send("PATCH", f"/api/documents/{first}/", {"title": title})
+            if len(ls_ids) > 1:
+                pl.merge(ls_ids, first, True)  # Lieferschein-Originale in den Papierkorb
+                pending.append({"title": title, "inv": inv["id"], "exclude": ls_ids})
+            elif link_field:
+                pl.set_doc_link(first, link_field, [inv["id"]])
+            if mark_invoice:
+                pl.modify_tags([inv["id"]], add=[merged_tag_id])
+            done.append({"title": title, "count": len(ls_ids), "bundle": True})
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{title}: {e}")
+            try:  # nichts gebündelt -> Lieferscheine wieder wie vorher
+                pl.modify_tags(ls_ids, remove=[done_tag_id])
+                pl.send("PATCH", f"/api/documents/{first}/", {"title": known_ls[first]["title"]})
+            except Exception:  # noqa: BLE001
+                pass
+    if pending and link_field:
+        threading.Thread(target=_finalize_bundles, args=(pending, link_field, t_ls), daemon=True).start()
+    if pending and AUTO_CLEAN_TITLES:
+        threading.Thread(target=_auto_clean_titles, args=(len(pending),), daemon=True).start()
+    return done, errors
+
+
+def _finalize_bundles(pending, link_field, t_ls, timeout=300, interval=10):
+    """Wartet, bis Paperless die gebündelten Lieferscheine angelegt hat, und setzt dann den Verweis zur Rechnung."""
+    deadline = time.time() + timeout
+    open_ = list(pending)
+    while open_ and time.time() < deadline:
+        time.sleep(interval)
+        pl = Paperless()
+        for p in list(open_):
+            try:
+                doc = pl.find_bundle(p["title"], t_ls, p["exclude"])
+                if doc:
+                    pl.set_doc_link(doc["id"], link_field, [p["inv"]])
+                    open_.remove(p)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def perform_merges(jobs, known_ls, delete_originals, extra):
@@ -2731,7 +2872,10 @@ def execute():
         ls_ids.sort(key=lambda x: (known_ls[x]["date"], x))
         jobs.append((all_groups[inv_id]["inv"], ls_ids))
 
-    done, errors = perform_merges(jobs, known_ls, stored["delete_originals"], stored.get("extra_tags", []))
+    if stored.get("mode") == "bundle":
+        done, errors = perform_bundles(jobs, known_ls, stored.get("extra_tags", []), stored.get("mark_invoice", True))
+    else:
+        done, errors = perform_merges(jobs, known_ls, stored["delete_originals"], stored.get("extra_tags", []))
     return page(RESULT, done=done, errors=errors, auto_clean=AUTO_CLEAN_TITLES)
 
 

@@ -20,6 +20,7 @@ services:
       DOCTYPE_DELIVERY: "Lieferschein"
       DONE_TAG: "LS-zugeordnet"           # Tag an verwendeten Lieferscheinen
       MERGED_TAG: "LS-ergänzt"            # Tag an Rechnungen mit ergänzten Lieferscheinen
+      DEFAULT_MODE: "merge"                # merge = Rechnung + Lieferscheine in ein Dokument, bundle = nur Lieferscheine bündeln
       # vorausgewählte Tags für die neuen Dokumente (kommagetrennt, im Formular änderbar)
       DEFAULT_TAGS: "Posteingang"
       FALLBACK_DAYS: "45"
